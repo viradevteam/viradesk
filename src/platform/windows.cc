@@ -358,6 +358,37 @@ extern "C"
         return true;
     }
 
+    // Attach this thread to the desktop that currently receives input.
+    // Comparing desktop names is not enough: a stale "Default" desktop has the
+    // same name, and SendInput on it returns ERROR_ACCESS_DENIED. Do not close
+    // the desktop handle returned by GetThreadDesktop; that handle is not owned
+    // and closing it drops the process desktop (GDI capture then fails).
+    static thread_local HDESK heldInputDesktop = NULL;
+
+    BOOL attachInputDesktopForInjection()
+    {
+        const DWORD access = DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW |
+                             DESKTOP_ENUMERATE | DESKTOP_HOOKCONTROL |
+                             DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS |
+                             DESKTOP_SWITCHDESKTOP | GENERIC_WRITE;
+        HDESK desktop = OpenInputDesktop(0, FALSE, access);
+        if (!desktop)
+        {
+            return FALSE;
+        }
+        if (!SetThreadDesktop(desktop))
+        {
+            CloseDesktop(desktop);
+            return FALSE;
+        }
+        if (heldInputDesktop)
+        {
+            CloseDesktop(heldInputDesktop);
+        }
+        heldInputDesktop = desktop;
+        return TRUE;
+    }
+
     int handleMask(uint8_t *rwbuffer, const uint8_t *mask, int width, int height, int bmWidthBytes, int bmHeight)
     {
         auto andMask = mask;

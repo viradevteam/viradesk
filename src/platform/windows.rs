@@ -199,6 +199,7 @@ pub fn clip_cursor(rect: Option<(i32, i32, i32, i32)>) -> bool {
 pub fn reset_input_cache() {}
 
 pub fn get_cursor() -> ResultType<Option<u64>> {
+    attach_input_desktop();
     unsafe {
         #[allow(invalid_value)]
         let mut ci: CURSORINFO = mem::MaybeUninit::uninit().assume_init();
@@ -574,6 +575,7 @@ extern "C" {
     ) -> BOOL;
     fn selectInputDesktop() -> BOOL;
     fn inputDesktopSelected() -> BOOL;
+    fn attachInputDesktopForInjection() -> BOOL;
     fn is_windows_server() -> BOOL;
     fn is_windows_10_or_greater() -> BOOL;
     fn handleMask(
@@ -1028,6 +1030,66 @@ lazy_static::lazy_static! {
 
 pub fn desktop_changed() -> bool {
     unsafe { inputDesktopSelected() == FALSE }
+}
+
+/// Bind the calling thread to the desktop that currently receives input.
+/// Used before mouse and keyboard injection. Capture threads keep using
+/// `try_change_desktop` so a failed video frame does not move their desktop.
+pub fn attach_input_desktop() -> bool {
+    unsafe { attachInputDesktopForInjection() == TRUE }
+}
+
+/// Move the cursor by a few pixels and put it back.
+/// Returns true only when `GetCursorPos` shows the move.
+pub fn prove_mouse_injection() -> bool {
+    unsafe {
+        let mut before: POINT = mem::zeroed();
+        if GetCursorPos(&mut before) == FALSE {
+            log::warn!(
+                "input injection self-check GetCursorPos failed: {}",
+                io::Error::last_os_error()
+            );
+            return false;
+        }
+        let width = GetSystemMetrics(SM_CXSCREEN);
+        let dx = if width > 0 && before.x > width - 80 {
+            -40
+        } else {
+            40
+        };
+        let mut extra: INPUT_u = mem::zeroed();
+        *extra.mi_mut() = MOUSEINPUT {
+            dx,
+            dy: 0,
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_MOVE,
+            time: 0,
+            dwExtraInfo: 100,
+        };
+        let mut input = INPUT {
+            type_: INPUT_MOUSE,
+            u: extra,
+        };
+        let sent = SendInput(1, &mut input, mem::size_of::<INPUT>() as i32);
+        let send_err = io::Error::last_os_error();
+        let mut after: POINT = mem::zeroed();
+        let got = GetCursorPos(&mut after);
+        let moved = got != FALSE && (after.x != before.x || after.y != before.y);
+        if moved {
+            SetCursorPos(before.x, before.y);
+        }
+        log::info!(
+            "input injection self-check SendInput sent={} last_error={} before={},{} after={},{} moved={}",
+            sent,
+            send_err,
+            before.x,
+            before.y,
+            after.x,
+            after.y,
+            moved
+        );
+        moved
+    }
 }
 
 pub fn try_change_desktop() -> bool {

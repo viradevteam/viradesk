@@ -839,7 +839,7 @@ pub fn is_left_up(evt: &MouseEvent) -> bool {
 
 #[cfg(windows)]
 pub fn mouse_move_relative(x: i32, y: i32) {
-    crate::platform::windows::try_change_desktop();
+    crate::platform::windows::attach_input_desktop();
     let mut en = ENIGO.lock().unwrap();
     en.mouse_move_relative(x, y);
 }
@@ -1286,7 +1286,12 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     }
 
     #[cfg(windows)]
-    crate::platform::windows::try_change_desktop();
+    {
+        crate::platform::windows::attach_input_desktop();
+        if crate::server::win_inject::forward_mouse(evt, conn) {
+            return;
+        }
+    }
     let buttons = evt.mask >> 3;
     let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
@@ -1722,7 +1727,7 @@ fn char_value_to_key(value: u32) -> Key {
 
 fn map_keyboard_mode(evt: &KeyEvent) {
     #[cfg(windows)]
-    crate::platform::windows::try_change_desktop();
+    crate::platform::windows::attach_input_desktop();
 
     // Wayland
     #[cfg(target_os = "linux")]
@@ -2207,7 +2212,7 @@ fn release_shift_for_char_input(en: &mut Enigo) {
 
 fn legacy_keyboard_mode(evt: &KeyEvent) {
     #[cfg(windows)]
-    crate::platform::windows::try_change_desktop();
+    crate::platform::windows::attach_input_desktop();
     let mut to_release: Vec<Key> = Vec::new();
 
     let mut en = ENIGO.lock().unwrap();
@@ -2252,7 +2257,7 @@ fn legacy_keyboard_mode(evt: &KeyEvent) {
 
 #[cfg(target_os = "windows")]
 fn translate_process_code(code: u32, down: bool) {
-    crate::platform::windows::try_change_desktop();
+    crate::platform::windows::attach_input_desktop();
     match code >> 16 {
         0 => sim_rdev_rawkey_position(code as _, down),
         vk_code => sim_rdev_rawkey_virtual(vk_code, down),
@@ -2487,6 +2492,14 @@ fn is_legacy_mode(evt: &KeyEvent) -> bool {
 pub fn handle_key_(evt: &KeyEvent) {
     if EXITING.load(Ordering::SeqCst) {
         return;
+    }
+
+    #[cfg(windows)]
+    {
+        crate::platform::windows::attach_input_desktop();
+        if crate::server::win_inject::forward_key(evt) {
+            return;
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -56,6 +56,8 @@ pub mod rdp_input;
 pub mod dbus;
 #[cfg(not(target_os = "android"))]
 pub mod input_service;
+#[cfg(windows)]
+pub mod win_inject;
 } else {
 mod clipboard_service {
 pub const NAME: &'static str = "";
@@ -706,6 +708,18 @@ pub async fn start_server(is_server: bool, no_server: bool) {
             log::warn!("drm: could not spawn the availability warm ({err}); skipping it");
         }
         input_service::fix_key_down_timeout_loop();
+        #[cfg(windows)]
+        match std::thread::Builder::new()
+            .name("input-inject".into())
+            .spawn(win_inject::prepare_injection)
+        {
+            Ok(handle) => {
+                if let Err(err) = handle.join() {
+                    log::error!("input injection prepare panicked: {:?}", err);
+                }
+            }
+            Err(err) => log::error!("input injection prepare thread failed: {}", err),
+        }
         #[cfg(target_os = "linux")]
         if input_service::wayland_use_uinput() {
             allow_err!(input_service::setup_uinput(0, 1920, 0, 1080).await);

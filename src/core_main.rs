@@ -381,6 +381,13 @@ pub fn core_main() -> Option<CoreMainAction> {
             log::info!("start --service");
             crate::start_os_service();
             return None;
+        } else if args[0] == "--win-input-inject" {
+            #[cfg(windows)]
+            {
+                log::info!("start --win-input-inject");
+                crate::server::win_inject::run_helper();
+            }
+            return None;
         } else if args[0] == "--server" {
             log::info!("start --server with user {}", crate::username());
             #[cfg(target_os = "linux")]
