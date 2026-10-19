@@ -1,23 +1,28 @@
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::{
     shared::windef::{HBITMAP, HDC},
-    um::wingdi::{
-        BitBlt,
-        CreateCompatibleBitmap,
-        CreateCompatibleDC,
-        CreateDCW,
-        DeleteDC,
-        DeleteObject,
-        GetDIBits,
-        SelectObject,
-        BITMAPINFO,
-        BITMAPINFOHEADER,
-        BI_RGB,
-        CAPTUREBLT,
-        DIB_RGB_COLORS, //CAPTUREBLT,
-        HGDI_ERROR,
-        RGBQUAD,
-        SRCCOPY,
+    um::{
+        errhandlingapi::GetLastError,
+        wingdi::{
+            BitBlt,
+            CreateCompatibleBitmap,
+            CreateCompatibleDC,
+            CreateDCW,
+            DeleteDC,
+            DeleteObject,
+            GetDIBits,
+            SelectObject,
+            BITMAPINFO,
+            BITMAPINFOHEADER,
+            BI_RGB,
+            CAPTUREBLT,
+            DIB_RGB_COLORS, //CAPTUREBLT,
+            HGDI_ERROR,
+            RGBQUAD,
+            SRCCOPY,
+        },
+        winuser::{GetSystemMetrics, SM_REMOTESESSION},
     },
 };
 
@@ -29,6 +34,9 @@ pub struct CapturerGDI {
     bmp: HBITMAP,
     width: i32,
     height: i32,
+    // CAPTUREBLT reads layered windows, but the remote display driver rejects
+    // it and BitBlt then fails the whole frame. RDP sessions start without it.
+    capture_blt: AtomicBool,
 }
 
 impl CapturerGDI {
@@ -77,19 +85,28 @@ impl CapturerGDI {
                 DeleteObject(bmp as _);
                 return Err("Can't select Windows buffer".into());
             }
+            let remote_session = GetSystemMetrics(SM_REMOTESESSION) != 0;
             Ok(Self {
                 screen_dc,
                 dc,
                 bmp,
                 width,
                 height,
+                capture_blt: AtomicBool::new(!remote_session),
             })
         }
     }
 
     pub fn frame(&self, data: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
-            let res = BitBlt(
+            let use_capture_blt = self.capture_blt.load(Ordering::Relaxed);
+            // CAPTUREBLT enables layered windows but also makes the cursor blink.
+            let rop = if use_capture_blt {
+                SRCCOPY | CAPTUREBLT
+            } else {
+                SRCCOPY
+            };
+            let mut res = BitBlt(
                 self.dc,
                 0,
                 0,
@@ -98,10 +115,32 @@ impl CapturerGDI {
                 self.screen_dc,
                 0,
                 0,
-                SRCCOPY | CAPTUREBLT, // CAPTUREBLT enable layered window but also make cursor blinking
+                rop,
             );
+            if res == 0 && use_capture_blt {
+                let err = GetLastError();
+                self.capture_blt.store(false, Ordering::Relaxed);
+                hbb_common::log::warn!(
+                    "BitBlt CAPTUREBLT failed (os error {err}), retrying without it"
+                );
+                res = BitBlt(
+                    self.dc,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    self.screen_dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+            }
             if res == 0 {
-                return Err("Failed to copy screen to Windows buffer".into());
+                let err = GetLastError();
+                return Err(format!(
+                    "Failed to copy screen to Windows buffer: os error {err}"
+                )
+                .into());
             }
 
             let stride = self.width * PIXEL_WIDTH;

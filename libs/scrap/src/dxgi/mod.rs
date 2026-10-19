@@ -82,7 +82,17 @@ impl Capturer {
         let mut adapter_desc1 = unsafe { mem::MaybeUninit::uninit().assume_init() };
         let mut gdi_capturer = None;
 
-        let mut res = if display.gdi {
+        // The Microsoft Remote Display Adapter (an RDP session) reports a
+        // system-memory desktop image that is black and never stamps
+        // LastPresentTime, so duplication either yields nothing or a black
+        // frame. GDI reads the same desktop correctly.
+        let remote_session = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
+        if remote_session && !display.gdi {
+            hbb_common::log::info!(
+                "RDP session: skip DXGI desktop duplication and capture with GDI"
+            );
+        }
+        let mut res = if display.gdi || remote_session {
             wrap_hresult(1)
         } else {
             let res = wrap_hresult(unsafe {
