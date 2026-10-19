@@ -1125,16 +1125,15 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
 void showLanguageSettings(OverlayDialogManager dialogManager) async {
   try {
     final langs = json.decode(await bind.mainGetLangs()) as List<dynamic>;
-    var lang = savedLangOrDefault();
+    var lang = bind.mainGetLocalOption(key: kCommConfKeyLang);
     dialogManager.show((setState, close, context) {
       setLang(v) async {
         if (lang != v) {
           setState(() {
-            lang = v == defaultOptionLang ? kProductDefaultLang : v;
+            lang = v;
           });
           await bind.mainSetLocalOption(key: kCommConfKeyLang, value: v);
           HomePage.homeKey.currentState?.refreshPages();
-          reloadCurrentWindow();
           Future.delayed(Duration(milliseconds: 200), close);
         }
       }
