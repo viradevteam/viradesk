@@ -16,8 +16,7 @@ class Install: Reactor.Component {
             </div>
             <div><button|checkbox #startmenu {startmenu_shortcuts}>{translate('Create start menu shortcuts')}</button></div>
             <div><button|checkbox #desktopicon {desktop_icon}>{translate('Create desktop icon')}</button></div>
-            <div #agreement .link style="margin-top: 2em;">{translate('End-user license agreement')}</div>
-            <div>{translate('agreement_tip')}</div>
+            <div style="margin-top: 2em;">{translate('agreement_tip')}</div>
             <div style="height: 1px; background: gray; margin-top: 1em" />
             <div style="text-align: right;">
                 <progress style={"color:" + color} style="display: none" /> 
@@ -47,10 +46,6 @@ class Install: Reactor.Component {
           install_path += handler.get_app_name();
           $(#path_input).value = install_path;
         }
-    }
-
-    event click $(#agreement) {
-        view.open_url("http://rustdesk.com/privacy");
     }
 
     event click $(#submit) {
