@@ -365,6 +365,7 @@ void _runApp(
       darkTheme: MyTheme.darkTheme,
       themeMode: themeMode,
       home: home,
+      locale: currentAppLocale(),
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -506,6 +507,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
               : isWeb
                   ? WebHomePage()
                   : HomePage(),
+          locale: currentAppLocale(),
           localizationsDelegates: const [
             GlobalMaterialLocalizations.delegate,
             GlobalWidgetsLocalizations.delegate,

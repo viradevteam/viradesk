@@ -893,35 +893,7 @@ class _GeneralState extends State<_General> {
   }
 
   Widget language() {
-    return futureBuilder(future: () async {
-      String langs = await bind.mainGetLangs();
-      return {'langs': langs};
-    }(), hasData: (res) {
-      Map<String, String> data = res as Map<String, String>;
-      List<dynamic> langsList = jsonDecode(data['langs']!);
-      Map<String, String> langsMap = {for (var v in langsList) v[0]: v[1]};
-      List<String> keys = langsMap.keys.toList();
-      List<String> values = langsMap.values.toList();
-      keys.insert(0, defaultOptionLang);
-      values.insert(0, translate('Default'));
-      String currentKey = bind.mainGetLocalOption(key: kCommConfKeyLang);
-      if (!keys.contains(currentKey)) {
-        currentKey = defaultOptionLang;
-      }
-      final isOptFixed = isOptionFixed(kCommConfKeyLang);
-      return ComboBox(
-        keys: keys,
-        values: values,
-        initialKey: currentKey,
-        onChanged: (key) async {
-          await bind.mainSetLocalOption(key: kCommConfKeyLang, value: key);
-          if (isWeb) reloadCurrentWindow();
-          if (!isWeb) reloadAllWindows();
-          if (!isWeb) bind.mainChangeLanguage(lang: key);
-        },
-        enabled: !isOptFixed,
-      ).marginOnly(left: _kContentHMargin);
-    });
+    return languageSelector().marginOnly(left: _kContentHMargin);
   }
 
   // How long an already-connected relay is held back to give the direct WebRTC

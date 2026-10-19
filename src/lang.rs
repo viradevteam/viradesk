@@ -128,45 +128,15 @@ pub(crate) fn is_cjk_lang(lang_or_locale: &str) -> bool {
     matches!(lang.as_str(), "zh" | "ja" | "ko")
 }
 
-fn resolve_lang(saved_lang: &str, locale: &str, cjk_fallback: bool) -> String {
-    let locale = locale.to_lowercase();
+fn resolve_lang(saved_lang: &str, _locale: &str, cjk_fallback: bool) -> String {
     let mut lang = saved_lang.to_lowercase();
-    if cjk_fallback && is_cjk_lang(&lang) {
-        return "en".to_owned();
+    // Custom-client "Default" is stored as an empty option. Both mean "no
+    // saved language", which is Persian rather than the operating-system locale.
+    if lang == "default" {
+        lang.clear();
     }
     if lang.is_empty() {
-        // zh_CN on Linux, zh-Hans-CN on mac, zh_CN_#Hans on Android
-        if locale.starts_with("zh") {
-            lang = (if locale.contains("tw") {
-                "zh-tw"
-            } else {
-                "zh-cn"
-            })
-            .to_owned();
-        }
-    }
-    if lang.is_empty() {
-        // pt_PT on Linux, pt-PT on mac, pt_PT on Android.
-        // Per CLDR locale inheritance, every Portuguese-speaking locale
-        // besides bare "pt" and Brazil's own variants (pt-BR/pt_BR) has
-        // pt-PT as its parent (Angola, Mozambique, Cape Verde, etc.),
-        // so it should resolve to European Portuguese.
-        if locale.starts_with("pt") {
-            lang = (if locale == "pt" || locale.starts_with("pt-br") || locale.starts_with("pt_br") {
-                "pt-br"
-            } else {
-                "pt-pt"
-            })
-            .to_owned();
-        }
-    }
-    if lang.is_empty() {
-        lang = locale
-            .split("-")
-            .next()
-            .map(|x| x.split("_").next().unwrap_or_default())
-            .unwrap_or_default()
-            .to_owned();
+        lang = "fa".to_owned();
     }
     if cjk_fallback && is_cjk_lang(&lang) {
         "en".to_owned()
@@ -337,32 +307,36 @@ mod test {
     }
 
     #[test]
-    fn test_resolve_lang_forces_english_for_cjk_locale_when_target_disables_cjk() {
+    fn test_resolve_lang_defaults_to_persian_when_unset() {
         use super::resolve_lang as f;
 
-        assert_eq!(f("", "zh_CN", true), "en");
-        assert_eq!(f("", "ja-JP", true), "en");
-        assert_eq!(f("", "ko_KR", true), "en");
+        assert_eq!(f("", "en-US", false), "fa");
+        assert_eq!(f("", "fa-IR", false), "fa");
+        assert_eq!(f("", "zh_CN", true), "fa");
+        assert_eq!(f("default", "en-US", false), "fa");
+        assert_eq!(f("en", "fa_IR", false), "en");
+        assert_eq!(f("fa", "en-US", false), "fa");
     }
 
     #[test]
-    fn test_resolve_lang_preserves_cjk_when_target_allows_cjk() {
+    fn test_resolve_lang_forces_english_for_saved_cjk_when_target_disables_cjk() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("zh-cn", "en-US", true), "en");
+        assert_eq!(f("ja", "en-US", true), "en");
+        assert_eq!(f("ko", "en-US", true), "en");
+    }
+
+    #[test]
+    fn test_resolve_lang_preserves_explicit_language() {
         use super::resolve_lang as f;
 
         assert_eq!(f("zh-cn", "en-US", false), "zh-cn");
-        assert_eq!(f("", "zh_TW", false), "zh-tw");
-        assert_eq!(f("", "ja-JP", false), "ja");
-    }
-
-    #[test]
-    fn test_resolve_lang_detects_pt_pt_and_pt_br_from_locale() {
-        use super::resolve_lang as f;
-
-        assert_eq!(f("", "pt-PT", false), "pt-pt");
-        assert_eq!(f("", "pt_PT", false), "pt-pt");
-        assert_eq!(f("", "pt-BR", false), "pt-br");
-        assert_eq!(f("", "pt_BR", false), "pt-br");
-        assert_eq!(f("", "pt-AO", false), "pt-pt");
-        assert_eq!(f("", "pt-MZ", false), "pt-pt");
+        assert_eq!(f("zh-tw", "en-US", false), "zh-tw");
+        assert_eq!(f("ja", "en-US", false), "ja");
+        assert_eq!(f("pt-pt", "en-US", false), "pt-pt");
+        assert_eq!(f("pt-br", "en-US", false), "pt-br");
+        assert_eq!(f("", "pt-PT", false), "fa");
+        assert_eq!(f("", "pt_BR", false), "fa");
     }
 }

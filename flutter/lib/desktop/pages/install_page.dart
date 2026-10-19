@@ -163,6 +163,10 @@ class _InstallPageBodyState extends State<_InstallPageBody>
             children: [
               Text(translate('Installation'),
                   style: Theme.of(context).textTheme.headlineMedium),
+              SizedBox(
+                width: double.infinity,
+                child: languageSelector(showLabel: true),
+              ).marginOnly(top: em),
               Row(
                 children: [
                   Text('${translate('Installation Path')}:')
