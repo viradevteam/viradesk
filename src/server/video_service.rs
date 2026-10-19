@@ -996,6 +996,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                     log::info!("dxgi error, fall back to gdi: {:?}", err);
                     continue;
                 }
+                #[cfg(windows)]
+                notify_capture_failure(&sp, &err);
                 return Err(err.into());
             }
             _ => {
@@ -1244,6 +1246,28 @@ fn check_change_scale(hardware: bool) -> ResultType<()> {
         bail!("SWITCH");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn notify_capture_failure(sp: &GenericService, err: &std::io::Error) {
+    let text = err.to_string();
+    if !text.contains("window capture produced no image") {
+        return;
+    }
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        log::error!("desktop capture failed: {text}");
+        let mut msg_out = Message::new();
+        let res = MessageBox {
+            msgtype: "nook-nocancel-hasclose".to_owned(),
+            title: "ViraDesk".to_owned(),
+            text,
+            link: "".to_owned(),
+            ..Default::default()
+        };
+        msg_out.set_message_box(res);
+        sp.send(msg_out);
+    });
 }
 
 fn check_privacy_mode_changed(

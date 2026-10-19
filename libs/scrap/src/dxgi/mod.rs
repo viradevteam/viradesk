@@ -975,7 +975,12 @@ impl Display {
     }
 
     fn create_gdi(&self) -> Option<CapturerGDI> {
-        if let Ok(res) = CapturerGDI::new(self.name(), self.width(), self.height()) {
+        if let Ok(res) = CapturerGDI::new(
+            self.name(),
+            (self.origin().0, self.origin().1),
+            self.width(),
+            self.height(),
+        ) {
             Some(res)
         } else {
             None

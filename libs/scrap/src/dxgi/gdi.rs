@@ -1,7 +1,12 @@
-use std::mem::size_of;
+use std::mem::{size_of, zeroed};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::{
-    shared::windef::{HBITMAP, HDC},
+    shared::{
+        minwindef::{DWORD, UINT},
+        ntdef::HRESULT,
+        windef::{HBITMAP, HDC, HWND, LPRECT, RECT},
+    },
     um::{
         errhandlingapi::GetLastError,
         wingdi::{
@@ -12,10 +17,12 @@ use winapi::{
             DeleteDC,
             DeleteObject,
             GetDIBits,
+            PatBlt,
             SelectObject,
             BITMAPINFO,
             BITMAPINFOHEADER,
             BI_RGB,
+            BLACKNESS,
             CAPTUREBLT,
             DIB_RGB_COLORS, //CAPTUREBLT,
             HGDI_ERROR,
@@ -26,6 +33,31 @@ use winapi::{
     },
 };
 
+const PW_RENDERFULLCONTENT: UINT = 2;
+const GW_HWNDNEXT: UINT = 2;
+const DWMWA_CLOAKED: DWORD = 14;
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetTopWindow(hwnd: HWND) -> HWND;
+    fn GetWindow(hwnd: HWND, cmd: UINT) -> HWND;
+    fn IsWindowVisible(hwnd: HWND) -> i32;
+    fn IsIconic(hwnd: HWND) -> i32;
+    fn GetWindowRect(hwnd: HWND, rect: LPRECT) -> i32;
+    fn PrintWindow(hwnd: HWND, hdc: HDC, flags: UINT) -> i32;
+    fn GetClassNameW(hwnd: HWND, name: *mut u16, max_count: i32) -> i32;
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmGetWindowAttribute(
+        hwnd: HWND,
+        attribute: DWORD,
+        value: *mut std::ffi::c_void,
+        size: DWORD,
+    ) -> HRESULT;
+}
+
 const PIXEL_WIDTH: i32 = 4;
 
 pub struct CapturerGDI {
@@ -34,13 +66,21 @@ pub struct CapturerGDI {
     bmp: HBITMAP,
     width: i32,
     height: i32,
+    origin_x: i32,
+    origin_y: i32,
     // CAPTUREBLT reads layered windows, but the remote display driver rejects
     // it and BitBlt then fails the whole frame. RDP sessions start without it.
     capture_blt: AtomicBool,
+    logged_window_capture: AtomicBool,
 }
 
 impl CapturerGDI {
-    pub fn new(name: &[u16], width: i32, height: i32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        name: &[u16],
+        origin: (i32, i32),
+        width: i32,
+        height: i32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         /* or Enumerate monitors with EnumDisplayMonitors,
         https://stackoverflow.com/questions/34987695/how-can-i-get-an-hmonitor-handle-from-a-display-device-name
             #[no_mangle]
@@ -92,7 +132,10 @@ impl CapturerGDI {
                 bmp,
                 width,
                 height,
+                origin_x: origin.0,
+                origin_y: origin.1,
                 capture_blt: AtomicBool::new(!remote_session),
+                logged_window_capture: AtomicBool::new(false),
             })
         }
     }
@@ -137,10 +180,21 @@ impl CapturerGDI {
             }
             if res == 0 {
                 let err = GetLastError();
-                return Err(format!(
-                    "Failed to copy screen to Windows buffer: os error {err}"
-                )
-                .into());
+                // The Microsoft Remote Display Adapter (RdpIdd) rejects BitBlt of
+                // the screen DC with ERROR_INVALID_HANDLE (6). PrintWindow of the
+                // visible top-level windows still returns the desktop.
+                let painted = self.capture_visible_windows();
+                if painted == 0 {
+                    return Err(format!(
+                        "Failed to copy screen to Windows buffer: os error {err}; window capture produced no image"
+                    )
+                    .into());
+                }
+                if !self.logged_window_capture.swap(true, Ordering::Relaxed) {
+                    hbb_common::log::info!(
+                        "Screen BitBlt failed (os error {err}); captured {painted} visible windows"
+                    );
+                }
             }
 
             let stride = self.width * PIXEL_WIDTH;
@@ -202,6 +256,89 @@ impl CapturerGDI {
                 crate::RotationMode::kRotate180,
             );
             Ok(())
+        }
+    }
+
+    /// Paint visible top-level windows into the screen bitmap, back to front.
+    /// Cloaked shell surfaces (the RDP input-experience window) are skipped
+    /// because they cover the desktop with a solid color.
+    fn capture_visible_windows(&self) -> i32 {
+        unsafe {
+            let mut windows = Vec::new();
+            let mut hwnd = GetTopWindow(ptr::null_mut());
+            let mut guard = 0;
+            while !hwnd.is_null() && guard < 500 {
+                windows.push(hwnd);
+                hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+                guard += 1;
+            }
+            windows.reverse();
+            // Uncovered pixels must not be uninitialized bitmap memory.
+            PatBlt(self.dc, 0, 0, self.width, self.height, BLACKNESS);
+            let mut painted = 0i32;
+            for hwnd in windows {
+                if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                    continue;
+                }
+                let mut cloaked: u32 = 0;
+                let hr = DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED,
+                    &mut cloaked as *mut u32 as *mut std::ffi::c_void,
+                    size_of::<u32>() as DWORD,
+                );
+                if hr == 0 && cloaked != 0 {
+                    continue;
+                }
+                if hr != 0 && Self::class_name(hwnd) == "Windows.UI.Core.CoreWindow" {
+                    continue;
+                }
+                let mut rect: RECT = zeroed();
+                if GetWindowRect(hwnd, &mut rect) == 0 {
+                    continue;
+                }
+                let ww = rect.right - rect.left;
+                let hh = rect.bottom - rect.top;
+                if ww < 8 || hh < 8 || ww > 8000 || hh > 8000 {
+                    continue;
+                }
+                let dx = rect.left - self.origin_x;
+                let dy = rect.top - self.origin_y;
+                if dx >= self.width || dy >= self.height || dx + ww <= 0 || dy + hh <= 0 {
+                    continue;
+                }
+                let wmem = CreateCompatibleDC(self.screen_dc);
+                if wmem.is_null() {
+                    continue;
+                }
+                let wbmp = CreateCompatibleBitmap(self.screen_dc, ww, hh);
+                if wbmp.is_null() {
+                    DeleteDC(wmem);
+                    continue;
+                }
+                let wold = SelectObject(wmem, wbmp as _);
+                let ok = PrintWindow(hwnd, wmem, PW_RENDERFULLCONTENT);
+                if ok != 0
+                    && BitBlt(self.dc, dx, dy, ww, hh, wmem, 0, 0, SRCCOPY) != 0
+                {
+                    painted += 1;
+                }
+                SelectObject(wmem, wold);
+                DeleteObject(wbmp as _);
+                DeleteDC(wmem);
+            }
+            painted
+        }
+    }
+
+    fn class_name(hwnd: HWND) -> String {
+        unsafe {
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n <= 0 {
+                return String::new();
+            }
+            String::from_utf16_lossy(&buf[..n as usize])
         }
     }
 }
