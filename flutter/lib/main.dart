@@ -358,6 +358,7 @@ void _runApp(
   final botToastBuilder = BotToastInit();
   runApp(RefreshWrapper(
     builder: (context) => GetMaterialApp(
+      key: ValueKey(currentAppLocale().toLanguageTag()),
       navigatorKey: globalKey,
       debugShowCheckedModeBanner: false,
       title: title,
@@ -379,7 +380,10 @@ void _runApp(
       builder: (context, child) {
         child = _keepScaleBuilder(context, child);
         child = botToastBuilder(context, child);
-        return child;
+        return Directionality(
+          textDirection: currentTextDirection(),
+          child: child ?? const SizedBox.shrink(),
+        );
       },
     ),
   ));
@@ -494,6 +498,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
           ChangeNotifierProvider.value(value: gFFI.peerTabModel),
         ],
         child: GetMaterialApp(
+          key: ValueKey(currentAppLocale().toLanguageTag()),
           navigatorKey: globalKey,
           debugShowCheckedModeBanner: false,
           title: isWeb
@@ -519,12 +524,15 @@ class _AppState extends State<App> with WidgetsBindingObserver {
             BotToastNavigatorObserver(),
           ],
           builder: isAndroid
-              ? (context, child) => AccessibilityListener(
-                    child: MediaQuery(
-                      data: MediaQuery.of(context).copyWith(
-                        textScaler: TextScaler.linear(1.0),
+              ? (context, child) => Directionality(
+                    textDirection: currentTextDirection(),
+                    child: AccessibilityListener(
+                      child: MediaQuery(
+                        data: MediaQuery.of(context).copyWith(
+                          textScaler: TextScaler.linear(1.0),
+                        ),
+                        child: child ?? Container(),
                       ),
-                      child: child ?? Container(),
                     ),
                   )
               : (context, child) {
@@ -534,6 +542,10 @@ class _AppState extends State<App> with WidgetsBindingObserver {
                       isWebDesktop) {
                     child = keyListenerBuilder(context, child);
                   }
+                  child = Directionality(
+                    textDirection: currentTextDirection(),
+                    child: child ?? const SizedBox.shrink(),
+                  );
                   if (isLinux) {
                     return buildVirtualWindowFrame(context, child);
                   } else {

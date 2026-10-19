@@ -680,6 +680,19 @@ Locale localeForLang(String lang) {
 /// MaterialApp locale. Flutter Directionality is RTL for Persian and LTR for English.
 Locale currentAppLocale() => localeForLang(savedLangOrDefault());
 
+/// Whole-app direction. Persian, Arabic, Hebrew, and Urdu are RTL.
+TextDirection currentTextDirection() {
+  switch (savedLangOrDefault().split(RegExp(r'[-_]')).first) {
+    case 'ar':
+    case 'fa':
+    case 'he':
+    case 'ur':
+      return TextDirection.rtl;
+    default:
+      return TextDirection.ltr;
+  }
+}
+
 Future<void> applyLanguage(String key) async {
   await bind.mainSetLocalOption(key: kCommConfKeyLang, value: key);
   if (isWeb) {
