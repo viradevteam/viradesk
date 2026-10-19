@@ -39,6 +39,8 @@ const DWMWA_CLOAKED: DWORD = 14;
 
 #[link(name = "user32")]
 extern "system" {
+    fn GetDC(hwnd: HWND) -> HDC;
+    fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
     fn GetTopWindow(hwnd: HWND) -> HWND;
     fn GetWindow(hwnd: HWND, cmd: UINT) -> HWND;
     fn IsWindowVisible(hwnd: HWND) -> i32;
@@ -180,20 +182,43 @@ impl CapturerGDI {
             }
             if res == 0 {
                 let err = GetLastError();
-                // The Microsoft Remote Display Adapter (RdpIdd) rejects BitBlt of
-                // the screen DC with ERROR_INVALID_HANDLE (6). PrintWindow of the
-                // visible top-level windows still returns the desktop.
-                let painted = self.capture_visible_windows();
-                if painted == 0 {
-                    return Err(format!(
-                        "Failed to copy screen to Windows buffer: os error {err}; window capture produced no image"
-                    )
-                    .into());
-                }
-                if !self.logged_window_capture.swap(true, Ordering::Relaxed) {
-                    hbb_common::log::info!(
-                        "Screen BitBlt failed (os error {err}); captured {painted} visible windows"
+                // CreateDC on the monitor name can return a DC that BitBlt rejects
+                // (ERROR_INVALID_HANDLE). The desktop window DC still holds the
+                // image; PrintWindow of the same windows is a black bitmap.
+                let desk = GetDC(ptr::null_mut());
+                if !desk.is_null() {
+                    res = BitBlt(
+                        self.dc,
+                        0,
+                        0,
+                        self.width,
+                        self.height,
+                        desk,
+                        self.origin_x,
+                        self.origin_y,
+                        SRCCOPY,
                     );
+                    ReleaseDC(ptr::null_mut(), desk);
+                }
+                if res != 0 {
+                    if !self.logged_window_capture.swap(true, Ordering::Relaxed) {
+                        hbb_common::log::info!(
+                            "Screen DC BitBlt failed (os error {err}); copied the desktop window"
+                        );
+                    }
+                } else {
+                    let painted = self.capture_visible_windows();
+                    if painted == 0 {
+                        return Err(format!(
+                            "Failed to copy screen to Windows buffer: os error {err}; window capture produced no image"
+                        )
+                        .into());
+                    }
+                    if !self.logged_window_capture.swap(true, Ordering::Relaxed) {
+                        hbb_common::log::info!(
+                            "Screen BitBlt failed (os error {err}); captured {painted} visible windows"
+                        );
+                    }
                 }
             }
 

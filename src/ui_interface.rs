@@ -197,6 +197,14 @@ pub fn use_texture_render() -> bool {
         if !cfg!(feature = "flutter") {
             return false;
         }
+        // SwiftShader draws Flutter widgets, but the external Texture the
+        // remote view uses stays black. Paint that view with the software image.
+        if std::env::var("ANGLE_DEFAULT_PLATFORM")
+            .map(|value| value.eq_ignore_ascii_case("swiftshader"))
+            .unwrap_or(false)
+        {
+            return false;
+        }
         // https://learn.microsoft.com/en-us/windows/win32/sysinfo/targeting-your-application-at-windows-8-1
         #[cfg(debug_assertions)]
         let default_texture = true;
