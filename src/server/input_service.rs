@@ -2272,7 +2272,11 @@ fn translate_process_code(code: u32, down: bool) {
     crate::platform::windows::attach_input_desktop();
     match code >> 16 {
         0 => sim_rdev_rawkey_position(code as _, down),
-        vk_code => sim_rdev_rawkey_virtual(vk_code, down),
+        vk_code => {
+            sim_rdev_rawkey_virtual(vk_code, down);
+            // SendInput keys can be swallowed by LL hooks; PostMessage still works.
+            let _ = crate::platform::windows::post_vk_to_foreground(vk_code as u16, down);
+        }
     };
 }
 
