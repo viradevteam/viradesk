@@ -111,28 +111,13 @@ pub fn prepare_injection() {
     if HELPER_PROCESS.load(Ordering::SeqCst) {
         return;
     }
-    if !crate::platform::windows::attach_input_desktop() {
-        log::warn!(
-            "server input thread failed to attach the input desktop: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    // Need a process that can address the interactive desktop. LocalSystem
-    // often cannot GetCursorPos; the interactive-user helper can, and it also
-    // posts window messages when SendInput buttons are hooked.
-    if crate::platform::windows::prove_input_injection() {
-        log::info!("input injection stays in the server process; GetCursorPos ok");
-        return;
-    }
-    log::warn!(
-        "server GetCursorPos failed; starting interactive-user input helper (RustDesk as_user path)"
-    );
-    match start_helper() {
+    // The session-0 service already started this helper with the logged-on
+    // user's token. Do not launch it here. CreateProcessAsUser from the
+    // LocalSystem --server (session of the RDP user, winlogon token) puts the
+    // child on a non-input desktop, and mouse_down/key SendInput returns
+    // Access Denied (os error 5) even though cursor movement can still work.
+    match connect_helper() {
         Ok(cursor_ok) => {
-            // Forward even if GetCursorPos failed in the helper. Window-message
-            // injection (PostMessage / EM_REPLACESEL) still works when the
-            // input stream is hooked, and the helper is the interactive user.
-            let _ = cursor_ok;
             FORWARD.store(true, Ordering::SeqCst);
             log::info!(
                 "input injection helper connected; GetCursorPos ok={}",
@@ -177,19 +162,9 @@ pub fn forward_key(evt: &KeyEvent) -> bool {
     true
 }
 
-fn start_helper() -> Result<bool> {
-    let exe = std::env::current_exe()?;
-    let cmd = format!("\"{}\" --win-input-inject", exe.display());
-    let session = crate::platform::windows::get_current_process_session_id()
-        .ok_or_else(|| anyhow!("no session id for input helper"))?;
-    // as_user=TRUE → explorer.exe token (interactive user), not winlogon/SYSTEM.
-    // That is the same LaunchProcessWin path RustDesk uses for run_as_user.
-    let handle = crate::platform::windows::launch_as_user_process(session, &cmd, false)?;
-    if !handle.is_null() {
-        unsafe { winapi::um::handleapi::CloseHandle(handle) };
-    }
+fn connect_helper() -> Result<bool> {
     let mut last_err = anyhow!("input helper pipe was not created");
-    for _ in 0..50 {
+    for _ in 0..150 {
         match open_client() {
             Ok(mut file) => {
                 write_frame_to(&mut file, KIND_PING, 0, &[])?;
