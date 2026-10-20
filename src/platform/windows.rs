@@ -1242,10 +1242,10 @@ unsafe fn notepad_type_and_read(ch: char) -> bool {
         log::error!("selftest: Notepad edit control not found");
         return false;
     }
-    let mut insert: Vec<u16> = ch.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut insert = vec![ch as u16, 0u16];
     let replaced = SendMessageW(
         edit,
-        EM_REPLACESEL,
+        EM_REPLACESEL as u32,
         TRUE as WPARAM,
         insert.as_mut_ptr() as LPARAM,
     );
