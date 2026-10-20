@@ -388,6 +388,17 @@ pub fn core_main() -> Option<CoreMainAction> {
                 crate::server::win_inject::run_helper();
             }
             return None;
+        } else if args[0] == "--win-input-selftest" {
+            #[cfg(windows)]
+            {
+                log::info!("start --win-input-selftest");
+                let code = crate::server::win_inject::run_selftest();
+                std::process::exit(code);
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
         } else if args[0] == "--server" {
             log::info!("start --server with user {}", crate::username());
             #[cfg(target_os = "linux")]

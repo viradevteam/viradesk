@@ -1132,6 +1132,142 @@ pub fn prove_mouse_injection() -> bool {
     prove_input_injection()
 }
 
+/// Open Notepad, activate it, click the client area, type `ch`, and verify the
+/// edit control contains that character. Used by `--win-input-selftest`.
+pub fn prove_notepad_keystroke(ch: char) -> ResultType<bool> {
+    use std::process::Command;
+    let mut child = Command::new("notepad.exe").spawn()?;
+    std::thread::sleep(Duration::from_millis(800));
+    let ok = unsafe { notepad_type_and_read(ch) };
+    let _ = child.kill();
+    let _ = child.wait();
+    // Close any leftover Notepad we activated (best-effort).
+    unsafe {
+        let title: Vec<u16> = "Untitled - Notepad\0".encode_utf16().collect();
+        let hwnd = FindWindowW(null_mut(), title.as_ptr());
+        if !hwnd.is_null() {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+    Ok(ok)
+}
+
+unsafe fn notepad_type_and_read(ch: char) -> bool {
+    let class: Vec<u16> = "Notepad\0".encode_utf16().collect();
+    let mut hwnd = FindWindowW(class.as_ptr(), null_mut());
+    for _ in 0..30 {
+        if !hwnd.is_null() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        hwnd = FindWindowW(class.as_ptr(), null_mut());
+    }
+    if hwnd.is_null() {
+        log::error!("selftest: Notepad window not found");
+        return false;
+    }
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rect: RECT = mem::zeroed();
+    if GetWindowRect(hwnd, &mut rect) == FALSE {
+        log::error!("selftest: GetWindowRect failed");
+        return false;
+    }
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    SetCursorPos(cx, cy);
+
+    let send_mouse = |flags: DWORD| -> bool {
+        let mut extra: INPUT_u = mem::zeroed();
+        *extra.mi_mut() = MOUSEINPUT {
+            dx: 0,
+            dy: 0,
+            mouseData: 0,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let mut input = INPUT {
+            type_: INPUT_MOUSE,
+            u: extra,
+        };
+        SendInput(1, &mut input, mem::size_of::<INPUT>() as i32) == 1
+    };
+    if !send_mouse(MOUSEEVENTF_LEFTDOWN) || !send_mouse(MOUSEEVENTF_LEFTUP) {
+        log::error!(
+            "selftest: click SendInput failed: {}",
+            io::Error::last_os_error()
+        );
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    let vk = VkKeyScanW(ch as u16) as u8 as u16;
+    if vk == 0xFF {
+        log::error!("selftest: VkKeyScanW failed for {}", ch);
+        return false;
+    }
+    let send_key = |flags: DWORD| -> bool {
+        let mut extra: INPUT_u = mem::zeroed();
+        *extra.ki_mut() = KEYBDINPUT {
+            wVk: vk,
+            wScan: 0,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let mut input = INPUT {
+            type_: INPUT_KEYBOARD,
+            u: extra,
+        };
+        SendInput(1, &mut input, mem::size_of::<INPUT>() as i32) == 1
+    };
+    if !send_key(0) || !send_key(KEYEVENTF_KEYUP) {
+        log::error!(
+            "selftest: key SendInput failed: {}",
+            io::Error::last_os_error()
+        );
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let edit_class: Vec<u16> = "Edit\0".encode_utf16().collect();
+    let mut edit = FindWindowExW(hwnd, null_mut(), edit_class.as_ptr(), null_mut());
+    if edit.is_null() {
+        // Windows 11 Notepad uses RichEditD2DPT / other hosts; try first child.
+        edit = GetWindow(hwnd, GW_CHILD);
+    }
+    if edit.is_null() {
+        log::error!("selftest: Notepad edit control not found");
+        return false;
+    }
+    let mut buf = vec![0u16; 64];
+    let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
+    if n <= 0 {
+        // Some Notepad builds keep text on a child of the child.
+        let nested = GetWindow(edit, GW_CHILD);
+        if !nested.is_null() {
+            let n2 = GetWindowTextW(nested, buf.as_mut_ptr(), buf.len() as i32);
+            if n2 > 0 {
+                buf.truncate(n2 as usize);
+            } else {
+                log::error!("selftest: GetWindowTextW empty");
+                return false;
+            }
+        } else {
+            log::error!("selftest: GetWindowTextW empty");
+            return false;
+        }
+    } else {
+        buf.truncate(n as usize);
+    }
+    let text = String::from_utf16_lossy(&buf);
+    log::info!("selftest: Notepad text={:?}", text);
+    text.contains(ch)
+}
+
 pub fn try_change_desktop() -> bool {
     unsafe {
         if inputDesktopSelected() == FALSE {

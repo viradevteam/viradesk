@@ -76,6 +76,36 @@ pub fn run_helper() {
     }
 }
 
+/// Local proof stronger than cursor move: open Notepad, click it, type a char,
+/// read it back from the edit control. Exit 0 only when the character appears.
+pub fn run_selftest() -> i32 {
+    if !crate::platform::windows::attach_input_desktop() {
+        log::error!(
+            "selftest: attach_input_desktop failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return 2;
+    }
+    if !crate::platform::windows::prove_input_injection() {
+        log::error!("selftest: SendInput click was rejected");
+        return 3;
+    }
+    match crate::platform::windows::prove_notepad_keystroke('V') {
+        Ok(true) => {
+            log::info!("selftest: Notepad received typed character V");
+            0
+        }
+        Ok(false) => {
+            log::error!("selftest: Notepad did not receive the typed character");
+            4
+        }
+        Err(err) => {
+            log::error!("selftest failed: {}", err);
+            5
+        }
+    }
+}
+
 pub fn prepare_injection() {
     if HELPER_PROCESS.load(Ordering::SeqCst) {
         return;
