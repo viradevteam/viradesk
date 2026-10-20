@@ -845,6 +845,43 @@ pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HAN
     Ok(h)
 }
 
+/// Launch `cmd` in `session_id` with the interactive user's token (explorer.exe),
+/// matching RustDesk `run_exe_in_session` / `LaunchProcessWin(..., as_user=TRUE)`.
+/// Used for input injection helpers that must call `SendInput` without UIPI denial.
+pub fn launch_as_user_process(session_id: DWORD, cmd: &str, show: bool) -> ResultType<HANDLE> {
+    use std::os::windows::ffi::OsStrExt;
+    let wstr: Vec<u16> = std::ffi::OsStr::new(&cmd)
+        .encode_wide()
+        .chain(Some(0).into_iter())
+        .collect();
+    let wstr = wstr.as_ptr();
+    let mut token_pid = 0;
+    let h = unsafe {
+        LaunchProcessWin(
+            wstr,
+            session_id,
+            TRUE,
+            if show { TRUE } else { FALSE },
+            &mut token_pid,
+        )
+    };
+    if h.is_null() {
+        if token_pid == 0 {
+            bail!(
+                "Failed to launch as user in session {}: no process {}",
+                session_id,
+                EXPLORER_EXE
+            );
+        }
+        bail!(
+            "Failed to launch as user in session {}: {}",
+            session_id,
+            io::Error::last_os_error()
+        );
+    }
+    Ok(h)
+}
+
 pub fn run_as_user(arg: Vec<&str>) -> ResultType<Option<std::process::Child>> {
     run_exe_in_cur_session(std::env::current_exe()?.to_str().unwrap_or(""), arg, false)
 }
@@ -1039,57 +1076,60 @@ pub fn attach_input_desktop() -> bool {
     unsafe { attachInputDesktopForInjection() == TRUE }
 }
 
-/// Move the cursor by a few pixels and put it back.
-/// Returns true only when `GetCursorPos` shows the move.
-pub fn prove_mouse_injection() -> bool {
+/// Prove that this thread can inject a real mouse button press.
+///
+/// Cursor *move* alone is not enough: LocalSystem in an RDP session can often
+/// move the cursor while `MOUSEEVENTF_LEFTDOWN` / keyboard `SendInput` return
+/// `ERROR_ACCESS_DENIED`. Only treat injection as working when a button down+up
+/// pair is accepted by the OS.
+pub fn prove_input_injection() -> bool {
     unsafe {
         let mut before: POINT = mem::zeroed();
-        if GetCursorPos(&mut before) == FALSE {
+        let got_pos = GetCursorPos(&mut before) != FALSE;
+        if !got_pos {
             log::warn!(
                 "input injection self-check GetCursorPos failed: {}",
                 io::Error::last_os_error()
             );
-            return false;
         }
-        let width = GetSystemMetrics(SM_CXSCREEN);
-        let dx = if width > 0 && before.x > width - 80 {
-            -40
-        } else {
-            40
+
+        let send_button = |flags: DWORD| -> (u32, io::Error) {
+            let mut extra: INPUT_u = mem::zeroed();
+            *extra.mi_mut() = MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            let mut input = INPUT {
+                type_: INPUT_MOUSE,
+                u: extra,
+            };
+            let sent = SendInput(1, &mut input, mem::size_of::<INPUT>() as i32) as u32;
+            (sent, io::Error::last_os_error())
         };
-        let mut extra: INPUT_u = mem::zeroed();
-        *extra.mi_mut() = MOUSEINPUT {
-            dx,
-            dy: 0,
-            mouseData: 0,
-            dwFlags: MOUSEEVENTF_MOVE,
-            time: 0,
-            dwExtraInfo: 100,
-        };
-        let mut input = INPUT {
-            type_: INPUT_MOUSE,
-            u: extra,
-        };
-        let sent = SendInput(1, &mut input, mem::size_of::<INPUT>() as i32);
-        let send_err = io::Error::last_os_error();
-        let mut after: POINT = mem::zeroed();
-        let got = GetCursorPos(&mut after);
-        let moved = got != FALSE && (after.x != before.x || after.y != before.y);
-        if moved {
-            SetCursorPos(before.x, before.y);
-        }
+
+        let (down_sent, down_err) = send_button(MOUSEEVENTF_LEFTDOWN);
+        let (up_sent, up_err) = send_button(MOUSEEVENTF_LEFTUP);
+        let ok = down_sent == 1 && up_sent == 1;
         log::info!(
-            "input injection self-check SendInput sent={} last_error={} before={},{} after={},{} moved={}",
-            sent,
-            send_err,
-            before.x,
-            before.y,
-            after.x,
-            after.y,
-            moved
+            "input injection self-check click down_sent={} down_err={} up_sent={} up_err={} got_cursor_pos={} ok={}",
+            down_sent,
+            down_err,
+            up_sent,
+            up_err,
+            got_pos,
+            ok
         );
-        moved
+        ok
     }
+}
+
+/// Backward-compatible alias used by older call sites.
+pub fn prove_mouse_injection() -> bool {
+    prove_input_injection()
 }
 
 pub fn try_change_desktop() -> bool {

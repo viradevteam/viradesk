@@ -1,10 +1,13 @@
-//! Forwards mouse and keyboard injection into a process that can call SendInput.
+//! Forwards mouse and keyboard injection into a user-session process that can
+//! call `SendInput`.
 //!
-//! The installed server is LocalSystem in the interactive session. On this host
-//! that process's `SendInput` returns ERROR_ACCESS_DENIED even after mouse and
-//! keyboard permission are granted. A process launched from the same winlogon
-//! token, on the current input desktop, can move the cursor. When a self-check
-//! on the server thread cannot, events are sent to that helper.
+//! The installed `--server` runs as LocalSystem in the interactive session. On
+//! RDP hosts that process can often *move* the cursor, but button and keyboard
+//! `SendInput` return `ERROR_ACCESS_DENIED` (UIPI / session isolation). RustDesk
+//! launches interactive helpers from the explorer (user) token via
+//! `LaunchProcessWin(..., as_user=TRUE, ...)`. We restore that path: prove a
+//! real click in-process first; if it fails, spawn `--win-input-inject` as the
+//! logged-on user on `winsta0\default` and forward events over a named pipe.
 
 use std::{
     ffi::{c_void, OsStr},
@@ -35,7 +38,8 @@ use windows::{
                 TRUSTEE_W,
             },
             CreateWellKnownSid, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
-            WinLocalSystemSid, ACE_FLAGS, ACL, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            WinInteractiveSid, WinLocalSystemSid, ACE_FLAGS, ACL, PSECURITY_DESCRIPTOR, PSID,
+            SECURITY_ATTRIBUTES,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ALL_ACCESS, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
@@ -65,9 +69,9 @@ pub fn run_helper() {
             std::io::Error::last_os_error()
         );
     }
-    let moved = crate::platform::windows::prove_mouse_injection();
-    log::info!("input helper self-check moved={}", moved);
-    if let Err(err) = serve(moved) {
+    let ok = crate::platform::windows::prove_input_injection();
+    log::info!("input helper click self-check ok={}", ok);
+    if let Err(err) = serve(ok) {
         log::error!("input helper stopped: {}", err);
     }
 }
@@ -82,17 +86,23 @@ pub fn prepare_injection() {
             std::io::Error::last_os_error()
         );
     }
-    if crate::platform::windows::prove_mouse_injection() {
-        log::info!("input injection stays in the server process; self-check moved the cursor");
+    // Require a real click, not cursor movement. Move-only success previously
+    // skipped the helper while mouse_down/keyboard still got Access Denied.
+    if crate::platform::windows::prove_input_injection() {
+        log::info!("input injection stays in the server process; click self-check ok");
         return;
     }
-    log::warn!("input injection self-check did not move the cursor; starting session helper");
+    log::warn!(
+        "server click self-check failed; starting interactive-user input helper (RustDesk as_user path)"
+    );
     match start_helper() {
-        Ok(moved) => {
+        Ok(true) => {
             FORWARD.store(true, Ordering::SeqCst);
-            log::info!(
-                "input injection helper is connected; helper self-check moved={}",
-                moved
+            log::info!("input injection helper connected; click self-check ok");
+        }
+        Ok(false) => {
+            log::error!(
+                "input injection helper connected but click self-check failed; not forwarding"
             );
         }
         Err(err) => log::error!("input injection helper failed: {}", err),
@@ -138,7 +148,9 @@ fn start_helper() -> Result<bool> {
     let cmd = format!("\"{}\" --win-input-inject", exe.display());
     let session = crate::platform::windows::get_current_process_session_id()
         .ok_or_else(|| anyhow!("no session id for input helper"))?;
-    let handle = crate::platform::windows::launch_privileged_process(session, &cmd)?;
+    // as_user=TRUE → explorer.exe token (interactive user), not winlogon/SYSTEM.
+    // That is the same LaunchProcessWin path RustDesk uses for run_as_user.
+    let handle = crate::platform::windows::launch_as_user_process(session, &cmd, false)?;
     if !handle.is_null() {
         unsafe { winapi::um::handleapi::CloseHandle(handle) };
     }
@@ -161,8 +173,8 @@ fn start_helper() -> Result<bool> {
     Err(last_err)
 }
 
-fn serve(moved: bool) -> Result<()> {
-    let handle = create_system_pipe()?;
+fn serve(ok: bool) -> Result<()> {
+    let handle = create_inject_pipe()?;
     let connected = unsafe { ConnectNamedPipe(handle, None) };
     if connected.is_err() {
         let err = std::io::Error::last_os_error();
@@ -189,7 +201,7 @@ fn serve(moved: bool) -> Result<()> {
             return Err(anyhow!("input helper frame truncated"));
         }
         match kind {
-            KIND_PING => file.write_all(&[if moved { 1 } else { 0 }])?,
+            KIND_PING => file.write_all(&[if ok { 1 } else { 0 }])?,
             KIND_MOUSE => {
                 if let Ok(evt) = MouseEvent::parse_from_bytes(&body) {
                     crate::server::input_service::handle_mouse_simulation_(&evt, conn);
@@ -207,7 +219,9 @@ fn serve(moved: bool) -> Result<()> {
 
 fn write_frame(kind: u8, conn: i32, body: &[u8]) -> Result<()> {
     let mut guard = PIPE.lock().unwrap();
-    let file = guard.as_mut().ok_or_else(|| anyhow!("input helper pipe is closed"))?;
+    let file = guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("input helper pipe is closed"))?;
     write_frame_to(file, kind, conn, body)
 }
 
@@ -259,9 +273,12 @@ fn open_client() -> Result<File> {
     }
 }
 
-fn create_system_pipe() -> Result<HANDLE> {
+/// Pipe ACL: LocalSystem (--server client) + Interactive (user helper server).
+fn create_inject_pipe() -> Result<HANDLE> {
     let mut system_sid = vec![0u8; 64];
     let mut system_sid_size = system_sid.len() as u32;
+    let mut interactive_sid = vec![0u8; 64];
+    let mut interactive_sid_size = interactive_sid.len() as u32;
     unsafe {
         CreateWellKnownSid(
             WinLocalSystemSid,
@@ -269,19 +286,31 @@ fn create_system_pipe() -> Result<HANDLE> {
             Some(PSID(system_sid.as_mut_ptr() as *mut c_void)),
             &mut system_sid_size,
         )
-        .map_err(|err| anyhow!("CreateWellKnownSid: {}", err))?;
+        .map_err(|err| anyhow!("CreateWellKnownSid SYSTEM: {}", err))?;
+        CreateWellKnownSid(
+            WinInteractiveSid,
+            None,
+            Some(PSID(interactive_sid.as_mut_ptr() as *mut c_void)),
+            &mut interactive_sid_size,
+        )
+        .map_err(|err| anyhow!("CreateWellKnownSid Interactive: {}", err))?;
     }
-    let mut explicit_access: [EXPLICIT_ACCESS_W; 1] = unsafe { std::mem::zeroed() };
-    explicit_access[0].grfAccessPermissions = FILE_ALL_ACCESS.0;
-    explicit_access[0].grfAccessMode = SET_ACCESS;
-    explicit_access[0].grfInheritance = ACE_FLAGS(0);
-    explicit_access[0].Trustee = TRUSTEE_W {
-        pMultipleTrustee: ptr::null_mut(),
-        MultipleTrusteeOperation: Default::default(),
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_USER,
-        ptstrName: PWSTR::from_raw(system_sid.as_ptr() as *mut u16),
-    };
+    let mut explicit_access: [EXPLICIT_ACCESS_W; 2] = unsafe { std::mem::zeroed() };
+    for (i, sid) in [system_sid.as_ptr(), interactive_sid.as_ptr()]
+        .into_iter()
+        .enumerate()
+    {
+        explicit_access[i].grfAccessPermissions = FILE_ALL_ACCESS.0;
+        explicit_access[i].grfAccessMode = SET_ACCESS;
+        explicit_access[i].grfInheritance = ACE_FLAGS(0);
+        explicit_access[i].Trustee = TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: Default::default(),
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: PWSTR::from_raw(sid as *mut u16),
+        };
+    }
     let mut new_acl: *mut ACL = ptr::null_mut();
     let acl_result = unsafe { SetEntriesInAclW(Some(&explicit_access), None, &mut new_acl) };
     if acl_result.0 != 0 || new_acl.is_null() {

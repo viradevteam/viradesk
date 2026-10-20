@@ -240,11 +240,11 @@ extern "C"
             ZeroMemory(&si, sizeof si);
             si.cb = sizeof si;
             si.dwFlags = STARTF_USESHOWWINDOW;
-            if (show)
-            {
-                si.lpDesktop = (LPWSTR)L"winsta0\\default";
-                si.wShowWindow = SW_SHOW;
-            }
+            // Always bind to the interactive desktop. Without this, a process
+            // launched into an RDP session (especially with as_user=FALSE /
+            // show=FALSE) can end up unable to GetCursorPos / SendInput.
+            si.lpDesktop = (LPWSTR)L"winsta0\\default";
+            si.wShowWindow = show ? SW_SHOW : SW_HIDE;
             wchar_t buf[MAX_PATH];
             wcscpy_s(buf, MAX_PATH, cmd);
             PROCESS_INFORMATION pi;
