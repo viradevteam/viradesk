@@ -78,17 +78,18 @@ pub fn run_helper() {
 
 /// Local proof stronger than cursor move: open Notepad, click it, type a char,
 /// read it back from the edit control. Exit 0 only when the character appears.
+///
+/// `GetCursorPos` failing is not fatal here — PostMessage / EM_REPLACESEL can
+/// still change the window when the input stream is hooked.
 pub fn run_selftest() -> i32 {
     if !crate::platform::windows::attach_input_desktop() {
-        log::error!(
+        log::warn!(
             "selftest: attach_input_desktop failed: {}",
             std::io::Error::last_os_error()
         );
-        return 2;
     }
     if !crate::platform::windows::prove_input_injection() {
-        log::error!("selftest: SendInput click was rejected");
-        return 3;
+        log::warn!("selftest: GetCursorPos failed; continuing with window messages");
     }
     match crate::platform::windows::prove_notepad_keystroke('V') {
         Ok(true) => {
@@ -116,8 +117,9 @@ pub fn prepare_injection() {
             std::io::Error::last_os_error()
         );
     }
-    // Need GetCursorPos for WindowFromPoint/PostMessage targeting. LocalSystem
-    // often cannot; the interactive-user helper can.
+    // Need a process that can address the interactive desktop. LocalSystem
+    // often cannot GetCursorPos; the interactive-user helper can, and it also
+    // posts window messages when SendInput buttons are hooked.
     if crate::platform::windows::prove_input_injection() {
         log::info!("input injection stays in the server process; GetCursorPos ok");
         return;
@@ -126,13 +128,15 @@ pub fn prepare_injection() {
         "server GetCursorPos failed; starting interactive-user input helper (RustDesk as_user path)"
     );
     match start_helper() {
-        Ok(true) => {
+        Ok(cursor_ok) => {
+            // Forward even if GetCursorPos failed in the helper. Window-message
+            // injection (PostMessage / EM_REPLACESEL) still works when the
+            // input stream is hooked, and the helper is the interactive user.
+            let _ = cursor_ok;
             FORWARD.store(true, Ordering::SeqCst);
-            log::info!("input injection helper connected; click self-check ok");
-        }
-        Ok(false) => {
-            log::error!(
-                "input injection helper connected but click self-check failed; not forwarding"
+            log::info!(
+                "input injection helper connected; GetCursorPos ok={}",
+                cursor_ok
             );
         }
         Err(err) => log::error!("input injection helper failed: {}", err),

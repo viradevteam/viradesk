@@ -1080,7 +1080,10 @@ pub fn desktop_changed() -> bool {
 pub fn attach_input_desktop() -> bool {
     unsafe {
         if inputDesktopSelected() == TRUE {
-            return true;
+            let mut probe: POINT = mem::zeroed();
+            if GetCursorPos(&mut probe) != FALSE {
+                return true;
+            }
         }
         attachInputDesktopForInjection() == TRUE
     }
@@ -1088,11 +1091,11 @@ pub fn attach_input_desktop() -> bool {
 
 /// True when this thread can resolve the cursor position for click targeting.
 ///
-/// On this RDP host, `SendInput` for buttons often returns success but a
-/// low-level hook drops the events (cursor *move*/`SetCursorPos` still works).
-/// Real clicks are delivered via `post_mouse_button_at_cursor` (PostMessage).
-/// The helper is only required when even `GetCursorPos` fails (common for
-/// LocalSystem before the interactive-user helper is started).
+/// On this RDP host, `SendInput` button events are often swallowed by a
+/// low-level hook (cursor *move* / `SetCursorPos` still work). Real clicks
+/// and keys are also posted as window messages (`post_mouse_button_at_cursor`,
+/// `post_vk_to_foreground`). The helper is required when even `GetCursorPos`
+/// fails (common for LocalSystem).
 pub fn prove_input_injection() -> bool {
     unsafe {
         let mut before: POINT = mem::zeroed();
