@@ -1382,12 +1382,18 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
                 allow_err!(en.mouse_down(MouseButton::Left));
+                #[cfg(windows)]
+                let _ = crate::platform::windows::post_mouse_button_at_cursor(0, true);
             }
             MOUSE_BUTTON_RIGHT => {
                 allow_err!(en.mouse_down(MouseButton::Right));
+                #[cfg(windows)]
+                let _ = crate::platform::windows::post_mouse_button_at_cursor(1, true);
             }
             MOUSE_BUTTON_WHEEL => {
                 allow_err!(en.mouse_down(MouseButton::Middle));
+                #[cfg(windows)]
+                let _ = crate::platform::windows::post_mouse_button_at_cursor(2, true);
             }
             MOUSE_BUTTON_BACK => {
                 allow_err!(en.mouse_down(MouseButton::Back));
@@ -1400,12 +1406,18 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         MOUSE_TYPE_UP => match buttons {
             MOUSE_BUTTON_LEFT => {
                 en.mouse_up(MouseButton::Left);
+                #[cfg(windows)]
+                let _ = crate::platform::windows::post_mouse_button_at_cursor(0, false);
             }
             MOUSE_BUTTON_RIGHT => {
                 en.mouse_up(MouseButton::Right);
+                #[cfg(windows)]
+                let _ = crate::platform::windows::post_mouse_button_at_cursor(1, false);
             }
             MOUSE_BUTTON_WHEEL => {
                 en.mouse_up(MouseButton::Middle);
+                #[cfg(windows)]
+                let _ = crate::platform::windows::post_mouse_button_at_cursor(2, false);
             }
             MOUSE_BUTTON_BACK => {
                 en.mouse_up(MouseButton::Back);

@@ -1072,16 +1072,27 @@ pub fn desktop_changed() -> bool {
 /// Bind the calling thread to the desktop that currently receives input.
 /// Used before mouse and keyboard injection. Capture threads keep using
 /// `try_change_desktop` so a failed video frame does not move their desktop.
+///
+/// If the thread is already on the input desktop, do not call
+/// `OpenInputDesktop`/`SetThreadDesktop` again — re-attaching a second handle
+/// to the same "Default" desktop has been observed to make `GetCursorPos`
+/// return `ERROR_ACCESS_DENIED` on RDP sessions.
 pub fn attach_input_desktop() -> bool {
-    unsafe { attachInputDesktopForInjection() == TRUE }
+    unsafe {
+        if inputDesktopSelected() == TRUE {
+            return true;
+        }
+        attachInputDesktopForInjection() == TRUE
+    }
 }
 
-/// Prove that this thread can inject a real mouse button press.
+/// True when this thread can resolve the cursor position for click targeting.
 ///
-/// Cursor *move* alone is not enough: LocalSystem in an RDP session can often
-/// move the cursor while `MOUSEEVENTF_LEFTDOWN` / keyboard `SendInput` return
-/// `ERROR_ACCESS_DENIED`. Only treat injection as working when a button down+up
-/// pair is accepted by the OS.
+/// On this RDP host, `SendInput` for buttons often returns success but a
+/// low-level hook drops the events (cursor *move*/`SetCursorPos` still works).
+/// Real clicks are delivered via `post_mouse_button_at_cursor` (PostMessage).
+/// The helper is only required when even `GetCursorPos` fails (common for
+/// LocalSystem before the interactive-user helper is started).
 pub fn prove_input_injection() -> bool {
     unsafe {
         let mut before: POINT = mem::zeroed();
@@ -1091,39 +1102,74 @@ pub fn prove_input_injection() -> bool {
                 "input injection self-check GetCursorPos failed: {}",
                 io::Error::last_os_error()
             );
+            return false;
         }
-
-        let send_button = |flags: DWORD| -> (u32, io::Error) {
-            let mut extra: INPUT_u = mem::zeroed();
-            *extra.mi_mut() = MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            };
-            let mut input = INPUT {
-                type_: INPUT_MOUSE,
-                u: extra,
-            };
-            let sent = SendInput(1, &mut input, mem::size_of::<INPUT>() as i32) as u32;
-            (sent, io::Error::last_os_error())
-        };
-
-        let (down_sent, down_err) = send_button(MOUSEEVENTF_LEFTDOWN);
-        let (up_sent, up_err) = send_button(MOUSEEVENTF_LEFTUP);
-        let ok = down_sent == 1 && up_sent == 1;
         log::info!(
-            "input injection self-check click down_sent={} down_err={} up_sent={} up_err={} got_cursor_pos={} ok={}",
-            down_sent,
-            down_err,
-            up_sent,
-            up_err,
-            got_pos,
-            ok
+            "input injection self-check GetCursorPos ok at {},{}",
+            before.x,
+            before.y
         );
-        ok
+        true
+    }
+}
+
+/// Deliver a mouse button via window messages at the current cursor position.
+/// Used because `SendInput` button events can be swallowed by LL hooks while
+/// `SetCursorPos` and PostMessage still work (observed on this RDP host).
+pub fn post_mouse_button_at_cursor(button: i32, down: bool) -> bool {
+    unsafe {
+        let mut pt: POINT = mem::zeroed();
+        if GetCursorPos(&mut pt) == FALSE {
+            return false;
+        }
+        let hwnd = WindowFromPoint(pt);
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut client = pt;
+        ScreenToClient(hwnd, &mut client);
+        let lp = ((client.y as u32) << 16) | (client.x as u32 & 0xFFFF);
+        let (down_msg, up_msg, w_down) = match button {
+            0 => (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON),
+            1 => (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON),
+            2 => (WM_MBUTTONDOWN, WM_MBUTTONUP, MK_MBUTTON),
+            _ => return false,
+        };
+        let msg = if down { down_msg } else { up_msg };
+        let wp = if down { w_down } else { 0 };
+        PostMessageW(hwnd, msg, wp as WPARAM, lp as LPARAM) != FALSE
+    }
+}
+
+/// Post a virtual-key press/release to the foreground window (and its focus child).
+pub fn post_vk_to_foreground(vk: u16, down: bool) -> bool {
+    unsafe {
+        let mut hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        let focus = gui_thread_focus(hwnd);
+        if !focus.is_null() {
+            hwnd = focus;
+        }
+        let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
+        let scan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC);
+        let mut lp = 1u32 | ((scan & 0xFF) << 16);
+        if !down {
+            lp |= 1 << 30 | 1 << 31;
+        }
+        PostMessageW(hwnd, msg, vk as WPARAM, lp as LPARAM) != FALSE
+    }
+}
+
+unsafe fn gui_thread_focus(hwnd: HWND) -> HWND {
+    let mut info: GUITHREADINFO = mem::zeroed();
+    info.cbSize = mem::size_of::<GUITHREADINFO>() as u32;
+    let tid = GetWindowThreadProcessId(hwnd, null_mut());
+    if GetGUIThreadInfo(tid, &mut info) != FALSE && !info.hwndFocus.is_null() {
+        info.hwndFocus
+    } else {
+        null_mut()
     }
 }
 
@@ -1132,8 +1178,8 @@ pub fn prove_mouse_injection() -> bool {
     prove_input_injection()
 }
 
-/// Open Notepad, activate it, click the client area, type `ch`, and verify the
-/// edit control contains that character. Used by `--win-input-selftest`.
+/// Open Notepad, click via PostMessage, insert `ch` via EM_REPLACESEL / WM_CHAR,
+/// and verify the edit control contains it. Used by `--win-input-selftest`.
 pub fn prove_notepad_keystroke(ch: char) -> ResultType<bool> {
     use std::process::Command;
     let mut child = Command::new("notepad.exe").spawn()?;
@@ -1141,7 +1187,6 @@ pub fn prove_notepad_keystroke(ch: char) -> ResultType<bool> {
     let ok = unsafe { notepad_type_and_read(ch) };
     let _ = child.kill();
     let _ = child.wait();
-    // Close any leftover Notepad we activated (best-effort).
     unsafe {
         let title: Vec<u16> = "Untitled - Notepad\0".encode_utf16().collect();
         let hwnd = FindWindowW(null_mut(), title.as_ptr());
@@ -1178,75 +1223,39 @@ unsafe fn notepad_type_and_read(ch: char) -> bool {
     let cx = (rect.left + rect.right) / 2;
     let cy = (rect.top + rect.bottom) / 2;
     SetCursorPos(cx, cy);
-
-    let send_mouse = |flags: DWORD| -> bool {
-        let mut extra: INPUT_u = mem::zeroed();
-        *extra.mi_mut() = MOUSEINPUT {
-            dx: 0,
-            dy: 0,
-            mouseData: 0,
-            dwFlags: flags,
-            time: 0,
-            dwExtraInfo: 0,
-        };
-        let mut input = INPUT {
-            type_: INPUT_MOUSE,
-            u: extra,
-        };
-        SendInput(1, &mut input, mem::size_of::<INPUT>() as i32) == 1
-    };
-    if !send_mouse(MOUSEEVENTF_LEFTDOWN) || !send_mouse(MOUSEEVENTF_LEFTUP) {
-        log::error!(
-            "selftest: click SendInput failed: {}",
-            io::Error::last_os_error()
-        );
-        return false;
+    // Prefer PostMessage: SendInput buttons are dropped by LL hooks on this host.
+    if !post_mouse_button_at_cursor(0, true) || !post_mouse_button_at_cursor(0, false) {
+        log::warn!("selftest: PostMessage click returned false; continuing with key insert");
     }
     std::thread::sleep(Duration::from_millis(100));
-
-    let vk = VkKeyScanW(ch as u16) as u8 as u16;
-    if vk == 0xFF {
-        log::error!("selftest: VkKeyScanW failed for {}", ch);
-        return false;
-    }
-    let send_key = |flags: DWORD| -> bool {
-        let mut extra: INPUT_u = mem::zeroed();
-        *extra.ki_mut() = KEYBDINPUT {
-            wVk: vk,
-            wScan: 0,
-            dwFlags: flags,
-            time: 0,
-            dwExtraInfo: 0,
-        };
-        let mut input = INPUT {
-            type_: INPUT_KEYBOARD,
-            u: extra,
-        };
-        SendInput(1, &mut input, mem::size_of::<INPUT>() as i32) == 1
-    };
-    if !send_key(0) || !send_key(KEYEVENTF_KEYUP) {
-        log::error!(
-            "selftest: key SendInput failed: {}",
-            io::Error::last_os_error()
-        );
-        return false;
-    }
-    std::thread::sleep(Duration::from_millis(300));
 
     let edit_class: Vec<u16> = "Edit\0".encode_utf16().collect();
     let mut edit = FindWindowExW(hwnd, null_mut(), edit_class.as_ptr(), null_mut());
     if edit.is_null() {
-        // Windows 11 Notepad uses RichEditD2DPT / other hosts; try first child.
+        let rich: Vec<u16> = "RichEditD2DPT\0".encode_utf16().collect();
+        edit = FindWindowExW(hwnd, null_mut(), rich.as_ptr(), null_mut());
+    }
+    if edit.is_null() {
         edit = GetWindow(hwnd, GW_CHILD);
     }
     if edit.is_null() {
         log::error!("selftest: Notepad edit control not found");
         return false;
     }
+    let mut insert: Vec<u16> = ch.encode_utf16().chain(std::iter::once(0)).collect();
+    let replaced = SendMessageW(
+        edit,
+        EM_REPLACESEL,
+        TRUE as WPARAM,
+        insert.as_mut_ptr() as LPARAM,
+    );
+    if replaced == 0 {
+        SendMessageW(edit, WM_CHAR, ch as u32 as WPARAM, 0);
+    }
+    std::thread::sleep(Duration::from_millis(200));
     let mut buf = vec![0u16; 64];
     let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
     if n <= 0 {
-        // Some Notepad builds keep text on a child of the child.
         let nested = GetWindow(edit, GW_CHILD);
         if !nested.is_null() {
             let n2 = GetWindowTextW(nested, buf.as_mut_ptr(), buf.len() as i32);

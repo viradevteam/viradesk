@@ -116,14 +116,14 @@ pub fn prepare_injection() {
             std::io::Error::last_os_error()
         );
     }
-    // Require a real click, not cursor movement. Move-only success previously
-    // skipped the helper while mouse_down/keyboard still got Access Denied.
+    // Need GetCursorPos for WindowFromPoint/PostMessage targeting. LocalSystem
+    // often cannot; the interactive-user helper can.
     if crate::platform::windows::prove_input_injection() {
-        log::info!("input injection stays in the server process; click self-check ok");
+        log::info!("input injection stays in the server process; GetCursorPos ok");
         return;
     }
     log::warn!(
-        "server click self-check failed; starting interactive-user input helper (RustDesk as_user path)"
+        "server GetCursorPos failed; starting interactive-user input helper (RustDesk as_user path)"
     );
     match start_helper() {
         Ok(true) => {
