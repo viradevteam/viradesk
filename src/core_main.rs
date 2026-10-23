@@ -95,6 +95,10 @@ pub fn core_main() -> Option<CoreMainAction> {
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if args.is_empty() {
+        // Home UI is on the interactive desktop; keep a working input helper
+        // even if the tray is delayed or hidden.
+        #[cfg(windows)]
+        crate::server::win_inject::ensure_user_helper();
         #[cfg(target_os = "linux")]
         let should_check_start_tray = crate::check_process("--server", false);
         // We can use `crate::check_process("--server", false)` on Windows.

@@ -46,8 +46,7 @@ use winapi::{
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
             GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
-            OpenProcessToken, ProcessIdToSessionId, TerminateProcess, PROCESS_INFORMATION,
-            STARTUPINFOW,
+            OpenProcessToken, ProcessIdToSessionId, PROCESS_INFORMATION, STARTUPINFOW,
         },
         securitybaseapi::{
             AllocateAndInitializeSid, DuplicateToken, EqualSid, FreeSid, GetTokenInformation,
@@ -695,10 +694,11 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
 
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
-    // Helper must be started by this session-0 service. Launching it from the
-    // session-2 LocalSystem --server lands on a non-input desktop: GetCursorPos
-    // and button SendInput then return Access Denied.
-    let mut h_input = launch_input_helper_in_session(session_id, NULL);
+    // Do NOT launch --win-input-inject from this session-0 service.
+    // CreateProcessAsUser(..., explorer token, winsta0\default) still yields a
+    // process that cannot GetCursorPos / OpenInputDesktop (Access Denied) on
+    // RDP. The interactive tray/UI must spawn the helper as a normal child so
+    // it inherits the real input desktop (see win_inject::ensure_user_helper).
     let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
     let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
@@ -714,7 +714,6 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                 // https://github.com/rustdesk/rustdesk/discussions/10039
                 let count = ipc::get_port_forward_session_count(1000).await.unwrap_or(0);
                 if count == 0 {
-                    h_input = launch_input_helper_in_session(session_id, h_input);
                     h_process = launch_server(session_id, true).await.unwrap_or(NULL);
                 }
             }
@@ -752,7 +751,6 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                                         );
                                         session_id = usid;
                                         stored_usid = Some(session_id);
-                                        h_input = launch_input_helper_in_session(session_id, h_input);
                                         h_process =
                                             launch_server(session_id, true).await.unwrap_or(NULL);
                                     }
@@ -787,7 +785,6 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             && exit_code != STILL_ACTIVE
                             && CloseHandle(h_process) == TRUE)
                     {
-                        h_input = launch_input_helper_in_session(session_id, h_input);
                         match launch_server(session_id, !close_sent).await {
                             Ok(ptr) => {
                                 h_process = ptr;
@@ -802,12 +799,6 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
         }
     }
 
-    if !h_input.is_null() {
-        unsafe {
-            TerminateProcess(h_input, 0);
-            CloseHandle(h_input);
-        }
-    }
     if !h_process.is_null() {
         send_close_async("").await.ok();
         unsafe { CloseHandle(h_process) };
@@ -836,45 +827,6 @@ async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDL
         std::env::current_exe()?.to_str().unwrap_or("")
     );
     launch_privileged_process(session_id, &cmd)
-}
-
-/// Start `--win-input-inject` with the interactive user's token.
-///
-/// The parent must be the session-0 service. `CreateProcessAsUser` from the
-/// LocalSystem `--server` (winlogon token inside the RDP session) attaches the
-/// child to a desktop named Default that is not the input desktop, and button
-/// `SendInput` never reaches the logged-on user.
-fn launch_input_helper_in_session(session_id: DWORD, previous: HANDLE) -> HANDLE {
-    if !previous.is_null() {
-        unsafe {
-            TerminateProcess(previous, 0);
-            CloseHandle(previous);
-        }
-    }
-    if session_id == 0xFFFFFFFF {
-        return NULL;
-    }
-    let exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(err) => {
-            log::error!("input helper exe path: {}", err);
-            return NULL;
-        }
-    };
-    let cmd = format!("\"{}\" --win-input-inject", exe.display());
-    match launch_as_user_process(session_id, &cmd, false) {
-        Ok(handle) => {
-            log::info!(
-                "launched interactive input helper in session {}",
-                session_id
-            );
-            handle
-        }
-        Err(err) => {
-            log::error!("launch interactive input helper: {}", err);
-            NULL
-        }
-    }
 }
 
 pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HANDLE> {

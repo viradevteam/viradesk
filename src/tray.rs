@@ -10,6 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn start_tray() {
+    // Input helper must be a normal child of this interactive user process so
+    // it inherits the RDP input desktop. Session-0 CreateProcessAsUser helpers
+    // fail GetCursorPos with Access Denied on this host.
+    #[cfg(windows)]
+    crate::server::win_inject::ensure_user_helper();
+
     if crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_TRAY) == "Y" {
         #[cfg(not(target_os = "macos"))]
         {

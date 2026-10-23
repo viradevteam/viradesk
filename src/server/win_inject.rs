@@ -3,11 +3,16 @@
 //!
 //! The installed `--server` runs as LocalSystem in the interactive session. On
 //! RDP hosts that process can often *move* the cursor, but button and keyboard
-//! `SendInput` return `ERROR_ACCESS_DENIED` (UIPI / session isolation). RustDesk
-//! launches interactive helpers from the explorer (user) token via
-//! `LaunchProcessWin(..., as_user=TRUE, ...)`. We restore that path: prove a
-//! real click in-process first; if it fails, spawn `--win-input-inject` as the
-//! logged-on user on `winsta0\default` and forward events over a named pipe.
+//! `SendInput` return `ERROR_ACCESS_DENIED` (UIPI / session isolation).
+//!
+//! Commit 49d231b launched `--win-input-inject` from the session-0 service via
+//! `CreateProcessAsUser` + explorer token. That child was still Administrator
+//! in the RDP session but could not `GetCursorPos` / `OpenInputDesktop`
+//! (Access Denied). The same binary started as a normal child of the
+//! interactive tray/UI inherits the real input desktop and passes the check.
+//!
+//! Path: tray/UI calls `ensure_user_helper()`; `--server` only connects to the
+//! named pipe and forwards events.
 
 use std::{
     ffi::{c_void, OsStr},
@@ -59,6 +64,7 @@ const KIND_KEY: u8 = 2;
 
 static HELPER_PROCESS: AtomicBool = AtomicBool::new(false);
 static FORWARD: AtomicBool = AtomicBool::new(false);
+static RECONNECT_STARTED: AtomicBool = AtomicBool::new(false);
 static PIPE: Mutex<Option<File>> = Mutex::new(None);
 
 pub fn run_helper() {
@@ -107,25 +113,76 @@ pub fn run_selftest() -> i32 {
     }
 }
 
+/// Spawn `--win-input-inject` as a normal child of this process.
+///
+/// Must be called from an interactive user process that already sits on the
+/// input desktop (tray / home UI). Do not call from LocalSystem `--service`
+/// or `--server` — `CreateProcessAsUser` from those parents leaves the child
+/// unable to `GetCursorPos` on this RDP host.
+pub fn ensure_user_helper() {
+    if HELPER_PROCESS.load(Ordering::SeqCst) {
+        return;
+    }
+    if crate::check_process("--win-input-inject", true) {
+        log::info!("input helper already running in this session");
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            log::error!("input helper exe path: {}", err);
+            return;
+        }
+    };
+    match std::process::Command::new(&exe)
+        .arg("--win-input-inject")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            log::info!(
+                "spawned interactive input helper as child pid={}",
+                child.id()
+            );
+            // Detach: tray keeps running; helper is independent.
+            std::mem::forget(child);
+        }
+        Err(err) => log::error!("failed to spawn input helper: {}", err),
+    }
+}
+
 pub fn prepare_injection() {
     if HELPER_PROCESS.load(Ordering::SeqCst) {
         return;
     }
-    // The session-0 service already started this helper with the logged-on
-    // user's token. Do not launch it here. CreateProcessAsUser from the
-    // LocalSystem --server (session of the RDP user, winlogon token) puts the
-    // child on a non-input desktop, and mouse_down/key SendInput returns
-    // Access Denied (os error 5) even though cursor movement can still work.
-    match connect_helper() {
-        Ok(cursor_ok) => {
-            FORWARD.store(true, Ordering::SeqCst);
-            log::info!(
-                "input injection helper connected; GetCursorPos ok={}",
-                cursor_ok
-            );
-        }
-        Err(err) => log::error!("input injection helper failed: {}", err),
+    if RECONNECT_STARTED.swap(true, Ordering::SeqCst) {
+        return;
     }
+    // Keep trying: tray may start the helper after --server.
+    std::thread::spawn(|| loop {
+        if HELPER_PROCESS.load(Ordering::SeqCst) {
+            return;
+        }
+        if FORWARD.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        match connect_helper_once() {
+            Ok(cursor_ok) => {
+                FORWARD.store(true, Ordering::SeqCst);
+                log::info!(
+                    "input injection helper connected; GetCursorPos ok={}",
+                    cursor_ok
+                );
+            }
+            Err(err) => {
+                log::warn!("input injection helper not ready: {}", err);
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
 }
 
 pub fn forward_mouse(evt: &MouseEvent, conn: i32) -> bool {
@@ -141,6 +198,8 @@ pub fn forward_mouse(evt: &MouseEvent, conn: i32) -> bool {
     };
     if let Err(err) = write_frame(KIND_MOUSE, conn, &bytes) {
         log::error!("failed to forward mouse event: {}", err);
+        FORWARD.store(false, Ordering::SeqCst);
+        *PIPE.lock().unwrap() = None;
     }
     true
 }
@@ -158,28 +217,19 @@ pub fn forward_key(evt: &KeyEvent) -> bool {
     };
     if let Err(err) = write_frame(KIND_KEY, 0, &bytes) {
         log::error!("failed to forward key event: {}", err);
+        FORWARD.store(false, Ordering::SeqCst);
+        *PIPE.lock().unwrap() = None;
     }
     true
 }
 
-fn connect_helper() -> Result<bool> {
-    let mut last_err = anyhow!("input helper pipe was not created");
-    for _ in 0..150 {
-        match open_client() {
-            Ok(mut file) => {
-                write_frame_to(&mut file, KIND_PING, 0, &[])?;
-                let mut ack = [0u8; 1];
-                file.read_exact(&mut ack)?;
-                *PIPE.lock().unwrap() = Some(file);
-                return Ok(ack[0] == 1);
-            }
-            Err(err) => {
-                last_err = err;
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-    Err(last_err)
+fn connect_helper_once() -> Result<bool> {
+    let mut file = open_client()?;
+    write_frame_to(&mut file, KIND_PING, 0, &[])?;
+    let mut ack = [0u8; 1];
+    file.read_exact(&mut ack)?;
+    *PIPE.lock().unwrap() = Some(file);
+    Ok(ack[0] == 1)
 }
 
 fn serve(ok: bool) -> Result<()> {
