@@ -1742,16 +1742,16 @@ fn simulate_(event_type: &EventType) {
 fn fallback_post_rdev_event(event_type: &EventType) -> bool {
     match event_type {
         EventType::KeyPress(RdevKey::RawKey(RawKey::ScanCode(code))) => {
-            crate::platform::windows::post_scan_to_foreground(code as u16, true)
+            crate::platform::windows::post_scan_to_foreground(*code as u16, true)
         }
         EventType::KeyRelease(RdevKey::RawKey(RawKey::ScanCode(code))) => {
-            crate::platform::windows::post_scan_to_foreground(code as u16, false)
+            crate::platform::windows::post_scan_to_foreground(*code as u16, false)
         }
         EventType::KeyPress(RdevKey::RawKey(RawKey::WinVirtualKeycode(code))) => {
-            crate::platform::windows::post_vk_to_foreground(code as u16, true)
+            crate::platform::windows::post_vk_to_foreground(*code as u16, true)
         }
         EventType::KeyRelease(RdevKey::RawKey(RawKey::WinVirtualKeycode(code))) => {
-            crate::platform::windows::post_vk_to_foreground(code as u16, false)
+            crate::platform::windows::post_vk_to_foreground(*code as u16, false)
         }
         EventType::KeyPress(key) => {
             if let Some(vk) = rdev_key_to_vk(key) {
