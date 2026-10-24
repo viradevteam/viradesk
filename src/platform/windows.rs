@@ -1,4 +1,4 @@
-use super::{validate_install_app_name, CursorData, ResultType};
+﻿use super::{validate_install_app_name, CursorData, ResultType};
 use crate::{
     common::PORTABLE_APPNAME_RUNTIME_ENV_KEY,
     custom_server::*,
@@ -1080,7 +1080,7 @@ pub fn desktop_changed() -> bool {
 /// `try_change_desktop` so a failed video frame does not move their desktop.
 ///
 /// If the thread is already on the input desktop, do not call
-/// `OpenInputDesktop`/`SetThreadDesktop` again — re-attaching a second handle
+/// `OpenInputDesktop`/`SetThreadDesktop` again â€” re-attaching a second handle
 /// to the same "Default" desktop has been observed to make `GetCursorPos`
 /// return `ERROR_ACCESS_DENIED` on RDP sessions.
 pub fn attach_input_desktop() -> bool {
@@ -1262,14 +1262,14 @@ pub fn prove_notepad_keystroke(ch: char) -> ResultType<bool> {
 }
 
 unsafe fn prove_win32_edit_keystroke(ch: char) -> bool {
-    let title: Vec<u16> = "ViraDeskInputSelftest\0".encode_utf16().collect();
     let edit_class: Vec<u16> = "Edit\0".encode_utf16().collect();
     let h_instance = GetModuleHandleW(null_mut());
-    // Top-level classic Edit — Win11 Notepad is WinUI and cannot prove injection.
+    // Empty window text â€” title string must not contain the probe char.
+    let empty: Vec<u16> = "\0".encode_utf16().collect();
     let edit = CreateWindowExW(
         WS_EX_TOPMOST,
         edit_class.as_ptr(),
-        title.as_ptr(),
+        empty.as_ptr(),
         WS_OVERLAPPEDWINDOW | WS_VISIBLE | ES_LEFT as u32 | ES_AUTOHSCROLL as u32,
         120,
         120,
@@ -1294,6 +1294,9 @@ unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
     ShowWindow(edit, SW_RESTORE);
     SetForegroundWindow(edit);
     SetFocus(edit);
+    // Clear any caption residue so contains(ch) cannot false-pass on the title.
+    let empty: Vec<u16> = "\0".encode_utf16().collect();
+    SendMessageW(edit, WM_SETTEXT, 0, empty.as_ptr() as LPARAM);
     std::thread::sleep(Duration::from_millis(200));
 
     let mut rect: RECT = mem::zeroed();
@@ -1305,7 +1308,9 @@ unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
     let cx = (rect.left + rect.right) / 2;
     let cy = (rect.top + rect.bottom) / 2;
     SetCursorPos(cx, cy);
-    if !post_mouse_button_at_cursor(0, true) || !post_mouse_button_at_cursor(0, false) {
+    let clicked =
+        post_mouse_button_at_cursor(0, true) && post_mouse_button_at_cursor(0, false);
+    if !clicked {
         log::warn!("selftest: PostMessage click returned false; continuing with key insert");
     }
     std::thread::sleep(Duration::from_millis(50));
@@ -1316,7 +1321,7 @@ unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
         let _ = post_vk_to_foreground(vk, true);
         let _ = post_vk_to_foreground(vk, false);
     }
-    let _ = post_char_to_foreground(ch as u16);
+    let char_ok = post_char_to_foreground(ch as u16);
     // Also exercise scan-code path used by map mode.
     let scan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16;
     if scan != 0 {
@@ -1328,7 +1333,6 @@ unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
     let mut buf = vec![0u16; 64];
     let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
     if n <= 0 {
-        // WM_GETTEXT via SendMessage
         let got = SendMessageW(
             edit,
             WM_GETTEXT,
@@ -1336,7 +1340,11 @@ unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
             buf.as_mut_ptr() as LPARAM,
         );
         if got <= 0 {
-            log::error!("selftest: GetWindowTextW empty");
+            log::error!(
+                "selftest: GetWindowTextW empty (click_ok={} char_ok={})",
+                clicked,
+                char_ok
+            );
             DestroyWindow(edit);
             return false;
         }
@@ -1345,8 +1353,9 @@ unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
         buf.truncate(n as usize);
     }
     let text = String::from_utf16_lossy(&buf);
-    log::info!("selftest: Edit text={:?}", text);
-    let ok = text.contains(ch);
+    log::info!("selftest: Edit text={:?} click_ok={} char_ok={}", text, clicked, char_ok);
+    // Empty starting text; pass only if the probe character was injected.
+    let ok = !text.is_empty() && text.contains(ch);
     DestroyWindow(edit);
     ok
 }
