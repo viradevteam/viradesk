@@ -1,18 +1,19 @@
 //! Forwards mouse and keyboard injection into a user-session process that can
 //! call `SendInput`.
 //!
-//! The installed `--server` runs as LocalSystem in the interactive session. On
-//! RDP hosts that process can often *move* the cursor, but button and keyboard
-//! `SendInput` return `ERROR_ACCESS_DENIED` (UIPI / session isolation).
+//! The installed `--server` runs as LocalSystem in the interactive session.
+//! On this RDP host `SendInput` / `mouse_event` return `ERROR_ACCESS_DENIED`
+//! for **every** process in the session (System and High-integrity interactive),
+//! so clicks/keys must be delivered via posted window messages from a helper
+//! that can at least `GetCursorPos` / `WindowFromPoint`.
 //!
 //! Commit 49d231b launched `--win-input-inject` from the session-0 service via
-//! `CreateProcessAsUser` + explorer token. That child was still Administrator
-//! in the RDP session but could not `GetCursorPos` / `OpenInputDesktop`
-//! (Access Denied). The same binary started as a normal child of the
-//! interactive tray/UI inherits the real input desktop and passes the check.
+//! `CreateProcessAsUser` + explorer token. That child could not `GetCursorPos`
+//! / `OpenInputDesktop`. Spawning the helper as a normal child of the
+//! interactive tray/UI (2c58954) inherits the real input desktop.
 //!
-//! Path: tray/UI calls `ensure_user_helper()`; `--server` only connects to the
-//! named pipe and forwards events.
+//! Path: tray/UI calls `ensure_user_helper()`; `--server` connects to the named
+//! pipe and forwards events; the helper posts mouse/key messages.
 
 use std::{
     ffi::{c_void, OsStr},

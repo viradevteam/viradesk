@@ -1381,19 +1381,20 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         }
         MOUSE_TYPE_DOWN => match buttons {
             MOUSE_BUTTON_LEFT => {
-                allow_err!(en.mouse_down(MouseButton::Left));
+                // PostMessage first: SendInput is Access Denied on this RDP host.
                 #[cfg(windows)]
                 let _ = crate::platform::windows::post_mouse_button_at_cursor(0, true);
+                allow_err!(en.mouse_down(MouseButton::Left));
             }
             MOUSE_BUTTON_RIGHT => {
-                allow_err!(en.mouse_down(MouseButton::Right));
                 #[cfg(windows)]
                 let _ = crate::platform::windows::post_mouse_button_at_cursor(1, true);
+                allow_err!(en.mouse_down(MouseButton::Right));
             }
             MOUSE_BUTTON_WHEEL => {
-                allow_err!(en.mouse_down(MouseButton::Middle));
                 #[cfg(windows)]
                 let _ = crate::platform::windows::post_mouse_button_at_cursor(2, true);
+                allow_err!(en.mouse_down(MouseButton::Middle));
             }
             MOUSE_BUTTON_BACK => {
                 allow_err!(en.mouse_down(MouseButton::Back));
@@ -1405,19 +1406,19 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         },
         MOUSE_TYPE_UP => match buttons {
             MOUSE_BUTTON_LEFT => {
-                en.mouse_up(MouseButton::Left);
                 #[cfg(windows)]
                 let _ = crate::platform::windows::post_mouse_button_at_cursor(0, false);
+                en.mouse_up(MouseButton::Left);
             }
             MOUSE_BUTTON_RIGHT => {
-                en.mouse_up(MouseButton::Right);
                 #[cfg(windows)]
                 let _ = crate::platform::windows::post_mouse_button_at_cursor(1, false);
+                en.mouse_up(MouseButton::Right);
             }
             MOUSE_BUTTON_WHEEL => {
-                en.mouse_up(MouseButton::Middle);
                 #[cfg(windows)]
                 let _ = crate::platform::windows::post_mouse_button_at_cursor(2, false);
+                en.mouse_up(MouseButton::Middle);
             }
             MOUSE_BUTTON_BACK => {
                 en.mouse_up(MouseButton::Back);
@@ -1719,12 +1720,84 @@ fn release_capslock() {
 #[cfg(not(target_os = "macos"))]
 #[inline]
 fn simulate_(event_type: &EventType) {
-    match rdev::simulate(&event_type) {
-        Ok(()) => (),
-        Err(_simulate_error) => {
-            log::error!("Could not send {:?}", &event_type);
+    let simulated = rdev::simulate(&event_type);
+    #[cfg(windows)]
+    {
+        // This RDP host denies SendInput for every integrity level. Always post
+        // as well so map-mode keys work from the interactive helper even when
+        // rdev reports success after a zero-event SendInput.
+        if !fallback_post_rdev_event(event_type) && simulated.is_err() {
+            log::error!("PostMessage key fallback failed for {:?}", event_type);
         }
     }
+    if let Err(_simulate_error) = simulated {
+        log::error!("Could not send {:?}", &event_type);
+    }
+}
+
+/// RDP sessions on this host deny `SendInput` (os error 5) for System and
+/// interactive High-integrity processes alike. Map/legacy keys must fall back
+/// to posted window messages from the interactive input helper.
+#[cfg(windows)]
+fn fallback_post_rdev_event(event_type: &EventType) -> bool {
+    match event_type {
+        EventType::KeyPress(RdevKey::RawKey(RawKey::ScanCode(code))) => {
+            crate::platform::windows::post_scan_to_foreground(code as u16, true)
+        }
+        EventType::KeyRelease(RdevKey::RawKey(RawKey::ScanCode(code))) => {
+            crate::platform::windows::post_scan_to_foreground(code as u16, false)
+        }
+        EventType::KeyPress(RdevKey::RawKey(RawKey::WinVirtualKeycode(code))) => {
+            crate::platform::windows::post_vk_to_foreground(code as u16, true)
+        }
+        EventType::KeyRelease(RdevKey::RawKey(RawKey::WinVirtualKeycode(code))) => {
+            crate::platform::windows::post_vk_to_foreground(code as u16, false)
+        }
+        EventType::KeyPress(key) => {
+            if let Some(vk) = rdev_key_to_vk(key) {
+                crate::platform::windows::post_vk_to_foreground(vk, true)
+            } else {
+                false
+            }
+        }
+        EventType::KeyRelease(key) => {
+            if let Some(vk) = rdev_key_to_vk(key) {
+                crate::platform::windows::post_vk_to_foreground(vk, false)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn rdev_key_to_vk(key: &RdevKey) -> Option<u16> {
+    // Minimal set for modifiers / navigation when RawKey is not used.
+    use RdevKey::*;
+    let vk = match key {
+        Alt | AltGr => 0x12u16,
+        ControlLeft | ControlRight => 0x11,
+        ShiftLeft | ShiftRight => 0x10,
+        MetaLeft | MetaRight => 0x5B,
+        Return => 0x0D,
+        Escape => 0x1B,
+        Space => 0x20,
+        Tab => 0x09,
+        Backspace => 0x08,
+        Delete => 0x2E,
+        UpArrow => 0x26,
+        DownArrow => 0x28,
+        LeftArrow => 0x25,
+        RightArrow => 0x27,
+        Home => 0x24,
+        End => 0x23,
+        PageUp => 0x21,
+        PageDown => 0x22,
+        CapsLock => 0x14,
+        _ => return None,
+    };
+    Some(vk)
 }
 
 #[inline]
@@ -1938,6 +2011,11 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
 
     if let Ok(chr) = char::try_from(chr) {
         en.key_sequence(&chr.to_string());
+        #[cfg(windows)]
+        {
+            // SendInput unicode is Access Denied on this RDP host.
+            let _ = crate::platform::windows::post_char_to_foreground(chr as u16);
+        }
     }
 }
 
@@ -1956,6 +2034,12 @@ fn process_seq(en: &mut Enigo, sequence: &str) {
     }
 
     en.key_sequence(&sequence);
+    #[cfg(windows)]
+    {
+        for ch in sequence.encode_utf16() {
+            let _ = crate::platform::windows::post_char_to_foreground(ch);
+        }
+    }
 }
 
 /// Delay in milliseconds to wait for clipboard to sync on Wayland.

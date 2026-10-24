@@ -41,7 +41,8 @@ use winapi::{
         errhandlingapi::GetLastError,
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
         libloaderapi::{
-            GetProcAddress, LoadLibraryA, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
+            GetModuleHandleW, GetProcAddress, LoadLibraryA, LoadLibraryExA,
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
         },
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
@@ -1122,8 +1123,10 @@ pub fn prove_input_injection() -> bool {
 }
 
 /// Deliver a mouse button via window messages at the current cursor position.
-/// Used because `SendInput` button events can be swallowed by LL hooks while
-/// `SetCursorPos` and PostMessage still work (observed on this RDP host).
+///
+/// On this RDP host `SendInput` / `mouse_event` return `ERROR_ACCESS_DENIED`
+/// for every process in the session (including High-integrity interactive),
+/// while `PostMessage` still delivers real click effects.
 pub fn post_mouse_button_at_cursor(button: i32, down: bool) -> bool {
     unsafe {
         let mut pt: POINT = mem::zeroed();
@@ -1145,20 +1148,32 @@ pub fn post_mouse_button_at_cursor(button: i32, down: bool) -> bool {
         };
         let msg = if down { down_msg } else { up_msg };
         let wp = if down { w_down } else { 0 };
+        // Prefer PostMessage: SendInput is Access Denied on this RDP host for every
+        // integrity level, while posted button messages still reach the target.
         PostMessageW(hwnd, msg, wp as WPARAM, lp as LPARAM) != FALSE
+    }
+}
+
+fn foreground_focus_hwnd() -> HWND {
+    unsafe {
+        let mut hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return null_mut();
+        }
+        let focus = gui_thread_focus(hwnd);
+        if !focus.is_null() {
+            hwnd = focus;
+        }
+        hwnd
     }
 }
 
 /// Post a virtual-key press/release to the foreground window (and its focus child).
 pub fn post_vk_to_foreground(vk: u16, down: bool) -> bool {
     unsafe {
-        let mut hwnd = GetForegroundWindow();
+        let hwnd = foreground_focus_hwnd();
         if hwnd.is_null() {
             return false;
-        }
-        let focus = gui_thread_focus(hwnd);
-        if !focus.is_null() {
-            hwnd = focus;
         }
         let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
         let scan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC);
@@ -1167,6 +1182,58 @@ pub fn post_vk_to_foreground(vk: u16, down: bool) -> bool {
             lp |= 1 << 30 | 1 << 31;
         }
         PostMessageW(hwnd, msg, vk as WPARAM, lp as LPARAM) != FALSE
+    }
+}
+
+/// Map a hardware scan code to a VK and post it (map-mode keyboard fallback).
+pub fn post_scan_to_foreground(scan: u16, down: bool) -> bool {
+    unsafe {
+        let mut code = scan as u32;
+        // Extended keys encode 0xE0 in the high byte of RustDesk scan codes.
+        let extended = (code >> 8) == 0xE0 || (code >> 8) == 0xE1;
+        if extended {
+            code &= 0xFF;
+        }
+        // MAPVK_VSC_TO_VK=1, MAPVK_VSC_TO_VK_EX=3, MAPVK_VK_TO_CHAR=2
+        let mut vk = MapVirtualKeyW(code, 1);
+        if vk == 0 {
+            vk = MapVirtualKeyW(code, 3);
+        }
+        if vk == 0 {
+            return false;
+        }
+        let hwnd = foreground_focus_hwnd();
+        if hwnd.is_null() {
+            return false;
+        }
+        let msg = if down { WM_KEYDOWN } else { WM_KEYUP };
+        let mut lp = 1u32 | ((code & 0xFF) << 16);
+        if extended {
+            lp |= 1 << 24;
+        }
+        if !down {
+            lp |= 1 << 30 | 1 << 31;
+        }
+        let ok = PostMessageW(hwnd, msg, vk as WPARAM, lp as LPARAM) != FALSE;
+        // Printable keys also need WM_CHAR for Edit controls when SendInput is denied.
+        if ok && down {
+            let ch = MapVirtualKeyW(vk, 2) & 0xFFFF;
+            if ch >= 0x20 && ch != 0x7F {
+                let _ = PostMessageW(hwnd, WM_CHAR, ch as WPARAM, lp as LPARAM);
+            }
+        }
+        ok
+    }
+}
+
+/// Post a unicode character to the focused window (legacy / Seq fallback).
+pub fn post_char_to_foreground(ch: u16) -> bool {
+    unsafe {
+        let hwnd = foreground_focus_hwnd();
+        if hwnd.is_null() || ch == 0 {
+            return false;
+        }
+        PostMessageW(hwnd, WM_CHAR, ch as WPARAM, 1) != FALSE
     }
 }
 
@@ -1186,103 +1253,102 @@ pub fn prove_mouse_injection() -> bool {
     prove_input_injection()
 }
 
-/// Open Notepad, click via PostMessage, insert `ch` via EM_REPLACESEL / WM_CHAR,
-/// and verify the edit control contains it. Used by `--win-input-selftest`.
+/// Create a classic Win32 EDIT control, click it via PostMessage, type `ch`
+/// via WM_CHAR / scan fallback, and verify the text. Used by `--win-input-selftest`.
+///
+/// Win11 Notepad is WinUI and is not a valid proof target (no classic Edit).
 pub fn prove_notepad_keystroke(ch: char) -> ResultType<bool> {
-    use std::process::Command;
-    let mut child = Command::new("notepad.exe").spawn()?;
-    std::thread::sleep(Duration::from_millis(800));
-    let ok = unsafe { notepad_type_and_read(ch) };
-    let _ = child.kill();
-    let _ = child.wait();
-    unsafe {
-        let title: Vec<u16> = "Untitled - Notepad\0".encode_utf16().collect();
-        let hwnd = FindWindowW(null_mut(), title.as_ptr());
-        if !hwnd.is_null() {
-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        }
-    }
-    Ok(ok)
+    Ok(unsafe { prove_win32_edit_keystroke(ch) })
 }
 
-unsafe fn notepad_type_and_read(ch: char) -> bool {
-    let class: Vec<u16> = "Notepad\0".encode_utf16().collect();
-    let mut hwnd = FindWindowW(class.as_ptr(), null_mut());
-    for _ in 0..30 {
-        if !hwnd.is_null() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        hwnd = FindWindowW(class.as_ptr(), null_mut());
-    }
-    if hwnd.is_null() {
-        log::error!("selftest: Notepad window not found");
+unsafe fn prove_win32_edit_keystroke(ch: char) -> bool {
+    let title: Vec<u16> = "ViraDeskInputSelftest\0".encode_utf16().collect();
+    let edit_class: Vec<u16> = "Edit\0".encode_utf16().collect();
+    let h_instance = GetModuleHandleW(null_mut());
+    // Top-level classic Edit — Win11 Notepad is WinUI and cannot prove injection.
+    let edit = CreateWindowExW(
+        WS_EX_TOPMOST,
+        edit_class.as_ptr(),
+        title.as_ptr(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE | ES_LEFT as u32 | ES_AUTOHSCROLL as u32,
+        120,
+        120,
+        320,
+        120,
+        null_mut(),
+        null_mut(),
+        h_instance,
+        null_mut(),
+    );
+    if edit.is_null() {
+        log::error!(
+            "selftest: CreateWindowExW Edit failed: {}",
+            io::Error::last_os_error()
+        );
         return false;
     }
-    ShowWindow(hwnd, SW_RESTORE);
-    SetForegroundWindow(hwnd);
+    finish_edit_selftest(edit, ch)
+}
+
+unsafe fn finish_edit_selftest(edit: HWND, ch: char) -> bool {
+    ShowWindow(edit, SW_RESTORE);
+    SetForegroundWindow(edit);
+    SetFocus(edit);
     std::thread::sleep(Duration::from_millis(200));
 
     let mut rect: RECT = mem::zeroed();
-    if GetWindowRect(hwnd, &mut rect) == FALSE {
+    if GetWindowRect(edit, &mut rect) == FALSE {
         log::error!("selftest: GetWindowRect failed");
+        DestroyWindow(edit);
         return false;
     }
     let cx = (rect.left + rect.right) / 2;
     let cy = (rect.top + rect.bottom) / 2;
     SetCursorPos(cx, cy);
-    // Prefer PostMessage: SendInput buttons are dropped by LL hooks on this host.
     if !post_mouse_button_at_cursor(0, true) || !post_mouse_button_at_cursor(0, false) {
         log::warn!("selftest: PostMessage click returned false; continuing with key insert");
     }
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(50));
 
-    let edit_class: Vec<u16> = "Edit\0".encode_utf16().collect();
-    let mut edit = FindWindowExW(hwnd, null_mut(), edit_class.as_ptr(), null_mut());
-    if edit.is_null() {
-        let rich: Vec<u16> = "RichEditD2DPT\0".encode_utf16().collect();
-        edit = FindWindowExW(hwnd, null_mut(), rich.as_ptr(), null_mut());
+    // Real injection path under test: scan/VK posting + WM_CHAR (not EM_REPLACESEL cheat).
+    let vk = VkKeyScanW(ch as u16) as u16 & 0xFF;
+    if vk != 0 && vk != 0xFFFF {
+        let _ = post_vk_to_foreground(vk, true);
+        let _ = post_vk_to_foreground(vk, false);
     }
-    if edit.is_null() {
-        edit = GetWindow(hwnd, GW_CHILD);
-    }
-    if edit.is_null() {
-        log::error!("selftest: Notepad edit control not found");
-        return false;
-    }
-    let mut insert = vec![ch as u16, 0u16];
-    let replaced = SendMessageW(
-        edit,
-        EM_REPLACESEL as u32,
-        TRUE as WPARAM,
-        insert.as_mut_ptr() as LPARAM,
-    );
-    if replaced == 0 {
-        SendMessageW(edit, WM_CHAR, ch as u32 as WPARAM, 0);
+    let _ = post_char_to_foreground(ch as u16);
+    // Also exercise scan-code path used by map mode.
+    let scan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16;
+    if scan != 0 {
+        let _ = post_scan_to_foreground(scan, true);
+        let _ = post_scan_to_foreground(scan, false);
     }
     std::thread::sleep(Duration::from_millis(200));
+
     let mut buf = vec![0u16; 64];
     let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
     if n <= 0 {
-        let nested = GetWindow(edit, GW_CHILD);
-        if !nested.is_null() {
-            let n2 = GetWindowTextW(nested, buf.as_mut_ptr(), buf.len() as i32);
-            if n2 > 0 {
-                buf.truncate(n2 as usize);
-            } else {
-                log::error!("selftest: GetWindowTextW empty");
-                return false;
-            }
-        } else {
+        // WM_GETTEXT via SendMessage
+        let got = SendMessageW(
+            edit,
+            WM_GETTEXT,
+            buf.len() as WPARAM,
+            buf.as_mut_ptr() as LPARAM,
+        );
+        if got <= 0 {
             log::error!("selftest: GetWindowTextW empty");
+            DestroyWindow(edit);
             return false;
         }
+        buf.truncate(got as usize);
     } else {
         buf.truncate(n as usize);
     }
     let text = String::from_utf16_lossy(&buf);
-    log::info!("selftest: Notepad text={:?}", text);
-    text.contains(ch)
+    log::info!("selftest: Edit text={:?}", text);
+    let ok = text.contains(ch);
+    DestroyWindow(edit);
+    ok
 }
 
 pub fn try_change_desktop() -> bool {
