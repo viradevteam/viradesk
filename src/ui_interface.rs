@@ -575,8 +575,27 @@ pub fn is_installed_lower_version() -> bool {
     return false;
     #[cfg(windows)]
     {
+        // Only when this process is the registered install. A portable or
+        // %LOCALAPPDATA% copy must not nag just because Program Files still
+        // has an older BuildDate from a previous service install.
+        let (_, _, _, installed_exe) = crate::platform::windows::get_install_info();
+        let Ok(current) = std::env::current_exe() else {
+            return false;
+        };
+        let Ok(current) = std::fs::canonicalize(&current) else {
+            return false;
+        };
+        let Ok(installed) = std::fs::canonicalize(&installed_exe) else {
+            return false;
+        };
+        if current != installed {
+            return false;
+        }
         let b = crate::platform::windows::get_reg("BuildDate");
-        return crate::BUILD_DATE.cmp(&b).is_gt();
+        if b.is_empty() {
+            return false;
+        }
+        crate::BUILD_DATE.cmp(&b).is_gt()
     }
 }
 

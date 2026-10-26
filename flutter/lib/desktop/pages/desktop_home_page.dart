@@ -458,7 +458,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       return buildInstallCard("", systemError, "", () {});
     }
 
-    if (isWindows && !bind.isDisableInstallation()) {
+    // ViraDesk is a custom client shipped as a portable zip. Do not push the
+    // Program Files install tip or the false "lower version" upgrade card when
+    // a newer portable build runs beside an older registered install. Service
+    // install can still be done later from settings when desired.
+    if (isWindows &&
+        !bind.isDisableInstallation() &&
+        !bind.isCustomClient()) {
       if (!bind.mainIsInstalled()) {
         return buildInstallCard(
             "", bind.isOutgoingOnly() ? "" : "install_tip", "Install",

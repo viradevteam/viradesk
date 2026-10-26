@@ -147,9 +147,28 @@ jobs:
           name: topmostwindow-artifacts-x64
           path: ./dist
 
+      - name: Add RDP-safe starter and portable zip
+        shell: pwsh
+        run: |
+          $csc = Join-Path ${env:WINDIR} "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) { throw "csc.exe not found" }
+          & $csc /nologo /optimize+ /target:winexe /out:.\dist\ViraDesk-Start.exe .\setup\ViraDeskStart.cs
+          if (-not (Test-Path .\dist\ViraDesk-Start.exe)) { throw "ViraDesk-Start.exe was not produced" }
+          if (-not (Test-Path .\dist\ViraDesk.exe)) { throw "ViraDesk.exe missing from dist" }
+          if (-not (Test-Path .\dist\librustdesk.dll)) { throw "librustdesk.dll missing from dist" }
+          # Portable zip only — no Setup.exe / install wizard.
+          Compress-Archive -Path .\dist\* -DestinationPath .\ViraDesk.zip -Force
+
       - name: Upload ViraDesk Windows folder
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ViraDesk-windows-x64
           path: dist
+          if-no-files-found: error
+
+      - name: Upload ViraDesk portable zip
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ViraDesk-zip
+          path: ViraDesk.zip
           if-no-files-found: error
