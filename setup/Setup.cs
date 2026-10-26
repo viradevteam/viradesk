@@ -98,21 +98,9 @@ namespace ViraDesk.Setup
             {
                 throw new InvalidOperationException("ViraDesk.exe بعد از نصب پیدا نشد.");
             }
-            // SwiftShader is only for an RDP session, where Flutter's DirectX
-            // path leaves the window blank. On a normal desktop it blacks out
-            // the remote-view texture, so a previous install must clear it.
-            if (GetSystemMetrics(0x1000) != 0)
-            {
-                Environment.SetEnvironmentVariable("ANGLE_DEFAULT_PLATFORM", "swiftshader", EnvironmentVariableTarget.User);
-            }
-            else if (string.Equals(
-                Environment.GetEnvironmentVariable("ANGLE_DEFAULT_PLATFORM", EnvironmentVariableTarget.User),
-                "swiftshader",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                Environment.SetEnvironmentVariable("ANGLE_DEFAULT_PLATFORM", null, EnvironmentVariableTarget.User);
-            }
-            CreateStartShortcut(Path.Combine(dir, "ViraDesk-Start.exe"));
+            // ANGLE/SwiftShader is chosen process-locally inside ViraDesk.exe.
+            // Do not set HKCU ANGLE_DEFAULT_PLATFORM for all apps.
+            CreateStartShortcut(exe);
             return exe;
         }
 
