@@ -147,16 +147,22 @@ jobs:
           name: topmostwindow-artifacts-x64
           path: ./dist
 
-      - name: Add RDP-safe starter and portable zip
+      - name: Portable zip (single ViraDesk.exe)
         shell: pwsh
         run: |
-          $csc = Join-Path ${env:WINDIR} "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-          if (-not (Test-Path $csc)) { throw "csc.exe not found" }
-          & $csc /nologo /optimize+ /target:winexe /out:.\dist\ViraDesk-Start.exe .\setup\ViraDeskStart.cs
-          if (-not (Test-Path .\dist\ViraDesk-Start.exe)) { throw "ViraDesk-Start.exe was not produced" }
           if (-not (Test-Path .\dist\ViraDesk.exe)) { throw "ViraDesk.exe missing from dist" }
           if (-not (Test-Path .\dist\librustdesk.dll)) { throw "librustdesk.dll missing from dist" }
-          # Portable zip only — no Setup.exe / install wizard.
+          # One user-facing exe only — SwiftShader is auto-selected inside ViraDesk.exe.
+          Get-ChildItem .\dist -Filter *.exe -File | ForEach-Object {
+            if ($_.Name -ne 'ViraDesk.exe') {
+              Remove-Item -Force $_.FullName
+            }
+          }
+          $exes = @(Get-ChildItem .\dist -Filter *.exe -File | Select-Object -ExpandProperty Name)
+          if ($exes.Count -ne 1 -or $exes[0] -ne 'ViraDesk.exe') {
+            throw "Expected exactly one exe ViraDesk.exe; found: $($exes -join ', ')"
+          }
+          # Portable zip only — no Setup.exe / Start.exe / install wizard.
           Compress-Archive -Path .\dist\* -DestinationPath .\ViraDesk.zip -Force
 
       - name: Upload ViraDesk Windows folder

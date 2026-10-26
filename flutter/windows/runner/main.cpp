@@ -20,9 +20,89 @@ const std::vector<std::string> parameters_white_list = {"--install", "--cm"};
 
 const wchar_t* getWindowClassName();
 
+namespace {
+
+// SM_REMOTESESSION — RDP / remote desktop session.
+constexpr int kSmRemoteSession = 0x1000;
+
+bool WideContainsI(const wchar_t* haystack, const wchar_t* needle) {
+  if (!haystack || !needle || !*needle) {
+    return false;
+  }
+  const size_t nlen = wcslen(needle);
+  for (const wchar_t* p = haystack; *p; ++p) {
+    if (_wcsnicmp(p, needle, nlen) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AdapterLooksSoftwareOnly(const wchar_t* device_string) {
+  // Microsoft Remote Display Adapter (RDP), Basic Display / Basic Render, and
+  // similar adapters cannot drive Flutter/ANGLE reliably — use SwiftShader.
+  return WideContainsI(device_string, L"Remote Display") ||
+         WideContainsI(device_string, L"Basic Display") ||
+         WideContainsI(device_string, L"Basic Render");
+}
+
+bool NeedsSwiftShaderAngle() {
+  if (::GetSystemMetrics(kSmRemoteSession) != 0) {
+    return true;
+  }
+
+  wchar_t session_name[64] = {0};
+  const DWORD session_len =
+      ::GetEnvironmentVariableW(L"SESSIONNAME", session_name, 64);
+  if (session_len > 0 && session_len < 64 &&
+      _wcsnicmp(session_name, L"RDP-", 4) == 0) {
+    return true;
+  }
+
+  DISPLAY_DEVICEW dd;
+  ZeroMemory(&dd, sizeof(dd));
+  dd.cb = sizeof(dd);
+  bool any_active = false;
+  bool any_real_gpu = false;
+  for (DWORD i = 0; ::EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+    if ((dd.StateFlags & DISPLAY_DEVICE_ACTIVE) == 0) {
+      continue;
+    }
+    if ((dd.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER) != 0) {
+      continue;
+    }
+    any_active = true;
+    if (AdapterLooksSoftwareOnly(dd.DeviceString)) {
+      continue;
+    }
+    any_real_gpu = true;
+  }
+  // No active output, or only Basic/Remote adapters → software ANGLE.
+  return !any_active || !any_real_gpu;
+}
+
+// Process-local only (never HKCU). Must run before Flutter/ANGLE init.
+void ConfigureAnglePlatformForSession() {
+  if (NeedsSwiftShaderAngle()) {
+    ::SetEnvironmentVariableW(L"ANGLE_DEFAULT_PLATFORM", L"swiftshader");
+    return;
+  }
+  // On a normal GPU host never force SwiftShader (it blacks out remote view).
+  wchar_t current[64] = {0};
+  const DWORD n =
+      ::GetEnvironmentVariableW(L"ANGLE_DEFAULT_PLATFORM", current, 64);
+  if (n > 0 && n < 64 && _wcsicmp(current, L"swiftshader") == 0) {
+    ::SetEnvironmentVariableW(L"ANGLE_DEFAULT_PLATFORM", nullptr);
+  }
+}
+
+}  // namespace
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
 {
+  ConfigureAnglePlatformForSession();
+
   HINSTANCE hInstance = LoadLibraryA("librustdesk.dll");
   if (!hInstance)
   {
